@@ -30,7 +30,7 @@ synthetic harness `verify_desc.js` is the whole verification story.
 ```bash
 bash build_loader.sh          # rebuilds desc_loader.js (runs node --check on the result)
 node --check rw_descbuilder.js
-node verify_desc.js           # synthetic harness — 100 tests, all passing
+node verify_desc.js           # synthetic harness — 227 tests, all passing
 ```
 
 To actually verify a change works, it has to be pasted into a real annotation-job page in Chrome
@@ -46,9 +46,13 @@ derived names are excluded from the auto-generated field list and can never be t
 custom variable name either: `span` (the computed top/bot difference, wired in by the UI layer)
 and `a` (the a/an article).
 
-- **Modifiers**: `{name:lower}` / `{name:upper}` / `{name:title}`; an unrecognized modifier passes
-  the value through unchanged, matching this codebase's house discipline for string transforms
-  (`boon-label-management`'s `RW._lblBuildFindMatcher` never throws either).
+- **Modifiers**: `{name:lower}` / `{name:upper}` / `{name:title}` / `{name:brk}`; an unrecognized
+  modifier passes the value through unchanged, matching this codebase's house discipline for
+  string transforms (`boon-label-management`'s `RW._lblBuildFindMatcher` never throws either).
+  `:brk` (round 4) is the one modifier that's **losslessly invertible** — see "Bracketing
+  elevations" below and `RW._dbModifierInvertible` — which is exactly why the reverse parser can
+  still trust a `{top:brk}` site the same as an unmodified one, while `:lower`/`:upper`/`:title`
+  destroy the original casing and can't be trusted back.
 - **`{a}`** resolves to "a"/"an" from whatever word ends up immediately after it — a genuine
   two-pass render, since that word isn't known until every other substitution around it has
   already happened. A leading digit run resolves by its *spoken* first word: 8/eight, 11/eleven,
@@ -73,6 +77,128 @@ subtraction via `RW._dbFormatFtIn`; both present but not parseable → `"top to 
 present → that side alone; neither → blank. No metric arithmetic — `Override` is the deliberate
 metric escape hatch (type `600mm` directly), not a unit converter.
 
+## Bracketing elevations (`:brk`, round 4)
+
+The measurement line is `{word}: {top:brk} - {bot:brk}`, not literal `[` `]` — `RW._dbBracketIfNegative`
+(the function `:brk` calls through `RW._dbApplyModifier`) brackets a value **only** when it parses
+as feet-inches (`RW._dbParseFtIn`) **and is negative**: `-12'-0"` → `[-12'-0"]`, but `12'-0"` → bare
+`12'-0"`, and a datum name (`T/WALL`) or `NS` — neither of which parses as feet-inches at all —
+also render bare. The brackets exist for exactly one reason: to keep a leading minus sign from
+being misread as the `" - "` separator between top and bot (`-12'-0" - -14'-0"` is unreadable;
+`[-12'-0"] - [-14'-0"]` isn't) — a positive elevation needs no such protection. `:brk` is
+idempotent (strips one existing bracket layer before deciding, so re-rendering an already-bracketed
+value never accumulates `[[...]]`), which matters because the reverse parser below always recovers
+`top`/`bot` unbracketed and Fill re-brackets on every write.
+
+Before round 4 the brackets were literal template text and appeared on *every* value regardless of
+sign — a real, if minor, bug (a positive elevation rendered `[12'-0"]` for no reason). Fixed
+alongside the reverse parser below because the parser has to understand both forms either way; a
+description written under the old always-bracketed template still parses correctly (`RW._dbBuildLineMatcher`'s
+`:brk` capture accepts a bracketed *or* bare token).
+
+## Reverse parser: prefilling an existing description on "Edit Label" (round 4)
+
+Opening "Edit Label" now reverse-parses whatever description is already in the textarea back into
+the builder's fields, via `RW._dbParseDescription(templateText, descText)` — a genuine feature
+reversal from round 1's original choice (see "Injection" below, and `RW._dbReadPrefill`). This is
+**not a general inverse of `RW._dbRender`** — see "What genuinely cannot be recovered" below — but
+a best-effort reverse parse that recovers what it safely can, reports what it couldn't, and never
+pretends otherwise.
+
+**The load-bearing observation**: every field value comes from a single-line `<input>`
+(`buildFieldRow`), so a value can never contain a newline. Therefore **one template line always
+renders to exactly one description line, in order**, and matching happens per line, never across
+`\n` — this bounds every regex to one short line (the real backtracking defense) and means a
+hand-edited word on one line never costs recovery of the others, unlike a single whole-template
+regex, which is all-or-nothing.
+
+**The pipeline**, in order:
+1. `RW._dbTokenizeTemplate(text)` — one array of `{literal}`/`{var}` tokens per template line.
+   Unlike `RW._dbParseTemplate`, this **keeps** the derived names `span` and `a` as var tokens —
+   they never become fields, but a line mentioning one still has to match against it.
+2. `RW._dbSlotScore(leftLit, rightLit, modifier)` — scores how trustworthy one occurrence of a
+   name is: a line-edge or real neighboring text scores highest; a boundary that abuts only
+   another placeholder (nothing but whitespace between them) scores 0 — that's the ambiguous-run
+   shape (`{a} {thickness} {desc:lower} {keyword:lower} with the`) this whole design routes
+   around. A name whose only occurrence is a whole line by itself (`{source}` alone on line 2)
+   scores just **1**, not "two strong edges" — its regex matches literally *any* line, so alone
+   it's evidence of nothing. `:lower`/`:upper`/`:title` disqualify a site from the +10 unmodified
+   bonus; `:brk` doesn't (see above).
+3. `RW._dbBuildLineMatcher(tokens, known, loose)` — compiles one line into an anchored regex. A
+   name already in `known` (resolved by an earlier pass) compiles to a **literal** — run through
+   the same `RW._dbApplyModifier` the renderer uses, so it's byte-identical to what render
+   produced — instead of another capture group. This is the mechanism, not scoring alone, that
+   resolves the ambiguous explanation line once its neighbours are pinned down elsewhere.
+4. `RW._dbParseDescription` runs this **three times**: pass 1 with no outside knowledge (recovers
+   every well-anchored line, e.g. lines 1-4 of the default template); arbitrate the winners into
+   `known`; pass 2 re-tries with `known` substituted as literals (this is what finally lets the
+   explanation line match, once `thickness`/`desc`/`keyword`/`word`/`source` are all pinned down,
+   leaving only `span` and `where` as real captures); pass 3 is a **loose** fallback (every
+   remaining capture lazy, capped at 4 lazy slots) for whatever a degraded/custom template still
+   leaves recoverable, tagged `weak`. If the description's line count doesn't match the
+   template's, a monotonic forward alignment scan runs first so a hand-inserted extra line
+   doesn't shift every later line out of step.
+5. **The false-positive guard**: if **no** non-wildcard template line ever matched at all, every
+   candidate sourced only from a whole-line-wildcard placeholder is discarded. This is what makes
+   an unrelated hand-written description (`verify_desc.js` test 12's own fixture) recover
+   *nothing*, rather than reading its first line as `source`.
+
+`RW._dbReadPrefill(modal, templateText)` is the DOM-facing entry point: reads `#label-description`
+(same selector `RW._dbRunFill` uses), parses it, and applies whenever **anything** was genuinely
+recovered (`RW._dbPrefillMinConfidence` defaults to `0`, console-overridable, in the style of
+`RW._dbArticleOverrides` — see "A confidence gate that was too strict" below for why it isn't
+higher by default). `applyPrefill` (private to the reset-fields section) is the **one** place a
+prefill becomes visible state — shared by the fresh-open path and the **Re-read** button, so the
+two can never drift apart, the same discipline that keeps the preview and Fill on a single
+`RW._dbComputeOutput`. The inline status row (`#rw-db-prefill-wrap`, visible in Simple mode too)
+reports what was read, what's blank, what to double-check, and — via `RW._dbComputeOutput()`
+compared byte-for-byte against the original — whether Fill will reproduce the description exactly
+or reword it, so an annotator whose hand-added sentence is about to be dropped is told so before
+they click.
+
+**A recovered manual span Override is inferred, not read from a dedicated field**: `{span}` stays
+derived, so `RW._dbParseDescription` still captures whatever text stood where it rendered, and if
+that text differs from what `RW._dbSpan` would recompute from the recovered `top`/`bot`, it's
+treated as an Override and `RW._dbSpanOverridden`/`RW._dbSpanOverrideValue` are set — **after**
+`applyPrefill`'s own clearing of those same flags, not before (the ordering that matters — see the
+spot-check below). A known false positive: an equivalent but differently-formatted measurement
+(`24"` vs `2'-0"`) also reads as an "override"; conservative in the safe direction, and the ✕
+button on the span row reverts it in one click.
+
+### What genuinely cannot be recovered
+
+- **Original casing under `:lower`/`:upper`/`:title`.** The default template gives every name an
+  unmodified site, so this doesn't bite today; a custom template where `{desc}` appears *only* as
+  `{desc:lower}` recovers `concrete`, not `Concrete` — tested (`16h`), not papered over. No
+  title-case "repair" heuristic — it would corrupt `CMU`, `T/WALL`, `NS`.
+- **`{a}`** — derived, no loss: recomputed identically from the recovered following word.
+- **`{span}`** — recoverable only as an inferred override string (above).
+- **Text the template can't represent.** A hand-added sentence isn't in the model, so Fill would
+  silently drop it — defended structurally, not through the parser: `#rw-db-prefill-status` says
+  "Fill will reword this description" whenever the byte-for-byte check fails.
+- **A value containing its own surrounding literal** (a `desc` containing ` - `) — the lazy
+  capture mis-splits; not defended. The `:brk` change *reduces* this class for `top`/`bot`
+  specifically, since a bracketed capture no longer needs to guess where the value ends.
+- **Which of several disagreeing sites is "right"** when they conflict — the best-anchored one
+  wins, the name is listed in `result.conflicts` (report-only; not currently surfaced in the UI).
+
+### A confidence gate that was too strict (caught before shipping)
+
+The first draft gated `RW._dbReadPrefill`'s `applied` decision on `result.confidence >=
+RW._dbPrefillMinConfidence` with a default of `0.4` (roughly: at least 2 of the default template's
+4 well-anchored lines had to match). This rejected the very case the user asked for — a
+2-line-only fragment (`desc`/`keyword`/`source` recoverable, everything else genuinely absent)
+scores `0.25` confidence and was silently declined entirely, fields staying blank with no
+indication why. Caught by this round's own spot-check discipline (a seam test's own precondition
+failed) before it ever reached a live page. Root cause: `confidence` and the false-positive guard
+in step 5 above were doing the *same* job — for any template where every line carries some literal
+text (every line of the default template does), a name can only ever be recovered from a
+non-wildcard line, and any non-wildcard match already flips the false-positive guard's condition —
+so gating on confidence *on top of* that guard didn't add safety, it just made partial recoveries
+too easy to reject. **Fixed** by defaulting `RW._dbPrefillMinConfidence` to `0` — apply whenever
+anything is genuinely recovered — while leaving the knob itself in place, console-overridable, for
+an annotator who'd rather see nothing than a lightly-anchored partial guess.
+
 ## Simple / Advanced
 
 **Simple is the default**: generated fields (in template order), the `span` row, the live preview,
@@ -93,19 +219,23 @@ a direct port, not a reinvention:
   `boon-tagger-mask`'s `rw_install.js` replaces `window.__RW` wholesale, which would wipe a
   `vdesc` marker on the shared namespace and let a re-paste register a second set of observers.
 - **Gate**: `#label-modal` whose `#label-modal-title` reads **either** `"Create New Label"` or
-  `"Edit Label"` — unlike `boon-ocr`'s create-only rule for its own fields. The user chose
-  blank-on-edit (no reverse-parsing of an existing description into the fields) over create-only,
-  so the builder is just as usable correcting an existing label as authoring a new one.
+  `"Edit Label"` — unlike `boon-ocr`'s create-only rule for its own fields. `modalIsEdit(modal)`
+  distinguishes the two titles for one purpose only: "Edit Label" also reverse-parses whatever
+  description is already there (`RW._dbReadPrefill`, see "Reverse parser" above) — round 1's
+  original blank-on-edit choice was reversed in round 4, since it made correcting one field of an
+  existing label mean retyping every field by eye off the rendered text.
 - **Two observers**, exactly `boon-ocr`'s pattern: a `MutationObserver` on `#label-modal` itself
   for `class`/`hidden`/`style` when it exists at install; otherwise one on `document.body`
   (`childList` + `subtree`) for the modal built lazily on first use.
 - **Reset on every hidden→visible transition** — not just at install. A stale value from the
   label that was just closed must never bleed into the next one, whether that next modal is a
   fresh "Create New Label" or a same-session "Edit Label" on a different entry. This is
-  `RW._dbResetFields`, which calls `RW._dbRebuildFields(false)` — the `false` matters: the same
-  rebuild function is also what a template edit calls (with no argument, defaulting to `true`) to
-  *preserve* values whose names survive the edit, and reusing the preserving path for a fresh
-  modal open was a real bug caught in this round's own spot-check (below).
+  `RW._dbResetFields(modal, prefill)`, which calls `applyPrefill(prefill)` → `RW._dbRebuildFields(false,
+  seed)` — the `false` matters: the same rebuild function is also what a template edit calls (with
+  no `preserve` argument, defaulting to `true`) to *preserve* values whose names survive the edit,
+  and reusing the preserving path for a fresh modal open was a real bug caught in round 1's own
+  spot-check (below). `seed` (round 4) is how a prefill's recovered values reach the inputs without
+  a second rebuild function to keep in sync with `preserve` — same precedent, same reason.
 - **Mount point**: `descInp.insertAdjacentElement('beforebegin', root)` — directly above
   Description, never touching `boon-ocr`'s own controls (which mount `afterend`, on the far side).
 - **Style**: one injected `<style id="rw-db-style">` setting both `color` and `background`
@@ -130,7 +260,13 @@ a direct port, not a reinvention:
 - **What the preview shows is exactly what Fill writes.** The preview and the write-back share one
   function, `RW._dbComputeOutput`, so there's no way for them to drift apart.
 - **A non-empty textarea needs a second click.** `RW._dbRunFill`'s two-click overwrite guard
-  protects a hand-written description from being clobbered by one stray click on Fill.
+  protects a hand-written description from being clobbered by one stray click on Fill. Deliberately
+  **left unchanged in round 4**: on "Edit Label" the textarea is always non-empty, so Fill always
+  needs two clicks there, prefill or not — the guard's intent (protect text this add-on didn't
+  author) still holds even after an exact prefill, since the parse may have silently dropped
+  something. `RW._dbPrefillBaseline` (set only when the preview reproduces the original
+  byte-for-byte) would let a future round relax this to "confirm only when the textarea holds text
+  the builder can't account for" without weakening the guard's intent — not done here, by choice.
 
 ## Round 1 (this round) — build + live-verification status
 
@@ -282,6 +418,79 @@ laptop viewport (a number chosen conservatively, not measured against the real m
 the sticky header actually stays reachable while the panel is scrolled on the real page; and
 whether the collapsed state surviving a modal reopen (proven synthetically in 13d-h/13d-i) holds
 against the real host's own modal show/hide mechanism, not just the stub's simulated one.
+
+## Round 4 — reverse-parse an existing description on "Edit Label", and fix unconditional brackets
+
+Requested directly: "when editing existing label, it should already prefill the values in the
+[builder]." Reverses round 1's own explicit blank-on-edit choice (see "Injection" above) — the
+consequence in practice was that correcting one field of an existing label meant retyping every
+field by eye off the rendered text. A second, independent bug surfaced while planning this: the
+measurement line hardcoded `[{top}] - [{bot}]`, bracketing every elevation regardless of sign, when
+the brackets only ever exist to keep a leading minus from being misread as the `" - "` separator —
+a positive elevation never needed them. Fixed together because the reverse parser has to
+understand both bracketed and bare forms either way. See "Reverse parser" and "Bracketing
+elevations" above for the design; not restated here.
+
+**A real bug caught by this round's own spot-check discipline, before shipping**: the first draft
+gated the prefill on `result.confidence >= 0.4` (roughly, at least half the default template's
+well-anchored lines had to match) — which silently declined a legitimate 2-line-only partial
+description (confidence `0.25`) entirely, leaving every field blank with no indication why. Caught
+when a seam test's own precondition failed. Root cause: the confidence gate and the parser's own
+false-positive guard (drop anything sourced only from a whole-line wildcard when no non-wildcard
+line matched at all) were doing the same job — for any template where every line carries real
+literal text, a name can only ever be recovered from a non-wildcard line, so the false-positive
+guard already implies non-zero confidence; gating on confidence *again* just rejected honest
+partial recoveries. Fixed by defaulting `RW._dbPrefillMinConfidence` to `0` (see above for detail).
+
+**Spot-checked, per this repo's own convention**: reverted the `seed` line in `RW._dbRebuildFields`
+and confirmed exactly the prefill-dependent tests failed (`17a`, `17b`, `17g`, `17k-3`, `17n`, and
+the reopen precondition) while `9k` (the round-1 reset-to-blank regression guard) stayed green —
+restored. Moved the span-override flag assignment in `applyPrefill` to *before* the clearing
+instead of after and confirmed *exactly* `17j` (and only `17j`) failed — restored; this is the
+ordering this round considered the single most likely place to introduce a silent bug. Reverted
+`RW._dbBracketIfNegative` to a bare passthrough and confirmed exactly the new `:brk` cases in
+section 5 plus `16s` (and `7a`, the pre-existing headline test, since its sample elevations are
+negative) failed — restored. Removed the parser's whole-line-wildcard-drop filter and confirmed
+*exactly* `16i` (the unrelated-hand-written-description case) failed — restored. `node --check`
+passes on both files; `desc_loader.js` rebuilt clean (60672 bytes, up from 34322 — the new parser
+is the majority of that growth) and reconfirmed free of any control byte (the round-2 lesson —
+this round's new code is mostly regex-source string literals, exactly the kind of literal that bit
+round 2).
+
+**`verify_desc.js` — grew from 109 to 227 tests.** New section 15 covers the tokenizer/regex layer
+in isolation (`RW._dbEscapeRegex`, `RW._dbTokenizeTemplate` keeping `span`/`a` unlike
+`RW._dbParseTemplate`, `RW._dbSlotScore`'s ordering rules, `RW._dbBuildLineMatcher`'s slot/group
+alignment and `maxSlots` cap). New section 16 covers `RW._dbParseDescription` directly: a
+byte-for-byte round trip on the headline sample and its inverse property (re-rendering the
+recovered values reproduces the original exactly); the same round trip through a genuinely
+ambiguous multi-word `desc` (`"Reinforced Concrete"`, the case a single whole-template regex
+cannot solve — proof the multi-pass literal-substitution mechanism, not just per-line matching, is
+what makes this work); the datum-name variant and a `height`→`depth` swap; a recovered blank
+counted as recovered-not-missing; the documented casing loss under a modifier-only site; the
+negative cases (unrelated hand-written text, blank/missing description or template, all
+non-throwing); a partial 2-line description's exact confidence fraction; a hand-added extra line
+recovering the real lines but breaking the exact-round-trip signal; span-override recovery; brace
+escaping; a backtracking-time bound on an adversarial line plus the length-cap skip; purity
+(deterministic, arguments unmutated, the module-shared `VAR_RE.lastIndex` not left dirty); and the
+old-always-bracketed-template compatibility case. New section 17 covers the DOM seam end to end:
+an Edit modal prefilling from a real rendered description with an exact preview match; a Create
+modal with the identical text sitting in the textarea *not* prefilling; an unparseable description
+leaving fields blank with an explaining status and no Clear button; Clear blanking everything
+without touching the host's own textarea; a modal reopen onto a *different* Edit description
+re-prefilling correctly (not the stale values) and a reopen onto Create staying blank with no
+leftover status text; `RW._dbRememberValues` filling in exactly the names the prefill missed with
+the status disclosing the split; the span-override ordering guard; the two-click Fill guard
+holding even after an exact prefill; **Re-read** parsing against the template as it is *now*
+(unlike the fresh-open path, which always parses against the default) rather than the stale
+template; and `RW._dbPrefillStatusText`'s wordings in isolation.
+
+**Not yet live-verified**: the prefill status row's actual legibility and layout inside the real,
+Tailwind-styled modal (proven only against the synthetic stub); whether real annotation
+descriptions in the wild — which may have accumulated small hand-edits, house-style drift, or
+predate this round's template entirely — recover as cleanly as the synthetic fixtures here, or
+mostly fall back to the "does not match" / partial cases; and whether 40 recovered fields and a new
+status row still fit comfortably under the existing 40vh height cap on a real, possibly small
+laptop viewport.
 
 ## Constraints (do not violate)
 

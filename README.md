@@ -52,8 +52,10 @@ field it writes into, is unaffected by this, same as always).
 
 - **Simple mode** (the default) shows just the fields the current template needs, a computed
   **span** row, a live preview of the exact text that will be written, and **Fill Description**.
-  A fresh label — Create or Edit — always starts every field blank; nothing is remembered from a
-  label you filled a moment ago unless you turn that on yourself (see "Remembering values" below).
+  A fresh **Create New Label** always starts every field blank; opening an **existing** label
+  instead prefills the fields from its current description — see "Editing an existing label"
+  below. Nothing is remembered from a label you filled a moment ago unless you turn that on
+  yourself (see "Remembering values" below).
 - The **▼** caret at the left of the panel's own header collapses it down to just that one thin
   strip — click the **▶** it becomes to expand again. The whole panel also caps its own height and
   scrolls internally, so however many fields a template needs, it can never grow tall enough to
@@ -76,14 +78,43 @@ field it writes into, is unaffected by this, same as always).
 - The app's own **Save**/**Cancel** buttons are completely unaffected — this add-on only ever
   touches the Description textarea's own value, the same as if you'd typed into it yourself.
 
+### Editing an existing label
+
+Click an existing pin and choose to edit it, and the builder reads the description that's already
+there and fills the fields from it — you're correcting a label, not retyping it from scratch. A
+small status line above the fields says what happened:
+
+- **`read all 8 fields from the existing description — the preview matches it exactly`** — the
+  common case: change what you need, the rest is already right.
+- **`read 6 of 8 fields ... — blank: thickness, where`** — a partial match; whatever couldn't be
+  confidently recovered is left blank rather than guessed, same as it would be on a fresh label.
+- **`... — double-check: desc, keyword`** — recovered, but from a less certain spot in the
+  description (e.g. a value that also appears elsewhere modified to lowercase) — worth a glance.
+- **`this description does not match the template — fields left blank`** — a hand-written
+  description, or one from a very different template; nothing here is guessed, you start fresh.
+- **`... — Fill will reword this description`** instead of "the preview matches it exactly" means
+  there's something in the existing text this add-on's fields can't represent (a hand-added
+  sentence, most often) — clicking Fill would drop it, so double-check the preview before you do.
+
+Two buttons sit next to that status line: **Clear** blanks every field back out (without touching
+the Description field itself) if the prefill guessed badly and you'd rather start over, and
+**Re-read** parses the Description field again — useful after you've switched to **Advanced** and
+changed the template, since the fresh-open prefill always reads against the default template.
+
+An **Override**d span (see below) is recovered too, if the description's height/depth line doesn't
+match what recomputing from the recovered top/bot would give.
+
 ### Advanced mode
 
 Click **Advanced** in the panel's own header to reveal:
 
 - **The template itself**, editable — `{name}` becomes a field automatically the moment it appears
   anywhere in the template text; remove it and the field (and its value) disappears. `[` and `]`
-  are always literal text, not part of the placeholder syntax, which is exactly why the height
-  line's brackets (`height: [{top}] - [{bot}]`) render as literal brackets in the output.
+  are always literal text if you type them directly, not part of the placeholder syntax — but the
+  default height line writes `{top:brk}` / `{bot:brk}` rather than literal brackets: the `:brk`
+  modifier brackets a value only when it's a *negative* elevation (`-12'-0"` → `[-12'-0"]`),
+  leaving a positive one (`12'-0"`) or a datum name (`T/WALL`) bare, since brackets only ever
+  existed to stop a leading minus sign from being misread as the " - " separator.
 - **Add variable** — type a name and a value, click **Insert**, and `{name}` is spliced into the
   template at wherever your cursor last was (or over whatever you had selected), already carrying
   the value you typed. Use this for anything the default template doesn't cover — rebar callouts,
@@ -105,6 +136,11 @@ __RW._dbRememberValues = true
 
 for the rest of the session. Set it back to `false` (or just re-paste the loader) to go back to
 starting blank every time.
+
+On an **existing** label, whatever the prefill above recovers from that label's own description
+always wins over a remembered value — a remembered value only fills in a field the prefill
+genuinely couldn't recover (the status line names which is which). On a **Create New Label**,
+remembering works exactly as it always has, unaffected by any of this.
 
 ## Boundaries
 
