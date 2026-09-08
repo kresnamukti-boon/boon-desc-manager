@@ -1,0 +1,19 @@
+# Claude Code local session/config data — machine-specific, not shared config
+.claude/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local lint/analysis config
+biome.json
+.pi-lens.json
+
+# Logs
+*.log
