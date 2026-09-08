@@ -227,6 +227,7 @@ function makeFakeLabelModal(win, opts){
     const codeInp = win.document.createElement('input'); codeInp.id = 'label-code';
     modal.appendChild(codeInp);
     const descInp = win.document.createElement('textarea'); descInp.id = 'label-description';
+    if (opts.description != null) descInp.value = opts.description;
     modal.appendChild(descInp);
     const submitBtn = win.document.createElement('button'); submitBtn.id = 'label-submit-btn';
     submitBtn.addEventListener('click', () => { win._submitClicked = (win._submitClicked || 0) + 1; });
@@ -321,6 +322,20 @@ async function main(){
       '5i: a blank value leaves its line present, not dropped');
     ok(RW._dbRender('thickness: {thickness}', {}) === 'thickness: ',
       '5j: an omitted value also leaves its line present');
+
+    // :brk — brackets a negative feet-inches elevation only; everything else renders bare.
+    ok(RW._dbRender('{x:brk}', { x: "-12'-0\"" }) === '[-12\'-0"]', '5k: negative feet-inches gets bracketed');
+    ok(RW._dbRender('{x:brk}', { x: "12'-0\"" }) === "12'-0\"", '5l: positive feet-inches renders bare');
+    ok(RW._dbRender('{x:brk}', { x: 'T/WALL' }) === 'T/WALL', '5m: a datum name (not parseable) renders bare');
+    ok(RW._dbRender('{x:brk}', { x: '' }) === '', '5n: a blank value stays blank under :brk');
+    ok(RW._dbRender('{x:brk}', { x: "[-12'-0\"]" }) === '[-12\'-0"]', '5o: an already-bracketed value keeps exactly one layer, not [[...]]');
+    ok(RW._dbRender('{x:brk}', { x: '18' }) === '18', '5p: a bare ambiguous number (RW._dbParseFtIn rejects it) renders bare');
+
+    ok(RW._dbUnapplyModifier('[-12\'-0"]', 'brk') === "-12'-0\"", '5q: :brk unapply strips one bracket layer');
+    ok(RW._dbUnapplyModifier('T/WALL', 'brk') === 'T/WALL', '5r: :brk unapply is a no-op on an unbracketed value');
+    ok(RW._dbUnapplyModifier('Wall', 'lower') === 'Wall', '5s: unapply passes through any non-brk modifier unchanged');
+    ok(RW._dbModifierInvertible.brk === true && !RW._dbModifierInvertible.lower,
+      '5t: only :brk is registered as losslessly invertible');
   }
 
   /* ===== 6. {a} article resolution ===== */
@@ -369,12 +384,13 @@ async function main(){
     };
     values.span = RW._dbSpan(values.top, values.bot, '').value;
     let out = RW._dbRender(RW._dbDefaultTemplate, values);
-    ok(out.indexOf('height: [T/WALL] - [T/FOOTING]') !== -1, '8a: datum values render into the measurement line');
+    ok(out.indexOf('height: T/WALL - T/FOOTING') !== -1,
+      '8a: datum values render bare (unbracketed) into the measurement line — no unit marks to bracket');
     ok(out.indexOf('with the height of T/WALL to T/FOOTING.') !== -1, '8b: span falls back to "top to bot" in the explanation');
 
     values.word = 'depth';
     out = RW._dbRender(RW._dbDefaultTemplate, values);
-    ok(out.indexOf('depth: [T/WALL] - [T/FOOTING]') !== -1 && out.indexOf('with the depth of') !== -1
+    ok(out.indexOf('depth: T/WALL - T/FOOTING') !== -1 && out.indexOf('with the depth of') !== -1
        && out.indexOf('the depth can be found') !== -1 && out.indexOf('height') === -1,
       '8c: {word} swaps every mention from height to depth in one change');
   }
@@ -658,6 +674,394 @@ async function main(){
     ok(!!modal.querySelector('#rw-ocr-btn-label-desc'), '14b: boon-ocr\'s own button is untouched');
     const ids = modal._children.map((c) => c.id);
     ok(new Set(ids).size === ids.length, '14c: no id collides between the two tools\' DOM');
+  }
+
+  /* ===== 15. Tokenizer / regex layer — the reverse parser's pure building blocks ===== */
+  {
+    const win = seedWin(makeStubWindow().win);
+    const RW = loadModule(win);
+
+    // 15a: RW._dbEscapeRegex
+    const specials = '.*+?^${}()|[]\\';
+    for (const ch of specials){
+      const re = new RegExp('^' + RW._dbEscapeRegex(ch) + '$');
+      ok(re.test(ch), '15a: RW._dbEscapeRegex escapes "' + ch + '" so it matches only itself');
+    }
+    ok(RW._dbEscapeRegex('a-b') === 'a-b', '15a-2: "-" is left unescaped (no special meaning outside a class)');
+
+    // 15b/15d/15e: RW._dbTokenizeTemplate
+    const lines = RW._dbTokenizeTemplate(RW._dbDefaultTemplate);
+    ok(lines.length === 5, '15b: the default template tokenizes into 5 lines');
+    const line3 = lines[2];
+    ok(line3.length === 5
+      && line3[0].type === 'var' && line3[0].name === 'word'
+      && line3[1].type === 'literal' && line3[1].text === ': '
+      && line3[2].type === 'var' && line3[2].name === 'top' && line3[2].modifier === 'brk'
+      && line3[3].type === 'literal' && line3[3].text === ' - '
+      && line3[4].type === 'var' && line3[4].name === 'bot' && line3[4].modifier === 'brk',
+      '15b-2: line 3 tokenizes to [word][": "][top:brk][" - "][bot:brk] — got ' + JSON.stringify(line3));
+    const withSpanA = RW._dbTokenizeTemplate('{a} {span}')[0];
+    ok(withSpanA.some((t) => t.type === 'var' && t.name === 'a') && withSpanA.some((t) => t.type === 'var' && t.name === 'span'),
+      '15d: {a} and {span} ARE tokenized as vars — unlike RW._dbParseTemplate, which drops them');
+    const escLine = RW._dbTokenizeTemplate('{{lit}} {x}')[0];
+    ok(escLine[0].type === 'literal' && escLine[0].text === '{lit} ', '15c: {{ }} become a literal single brace inside a literal token, never a var');
+    ok(RW._dbTokenizeTemplate('{desc:lower}')[0][0].modifier === 'lower', '15e: modifier captured');
+    ok(RW._dbTokenizeTemplate('{desc}')[0][0].modifier === null, '15e-2: absent modifier is null');
+
+    // 15f: RW._dbSlotScore
+    const S = RW._dbSlotScore;
+    ok(S(null, ' - ', null) > S(null, ' - ', 'lower'), '15f: an unmodified site outscores the same site modified');
+    ok(S(null, ' - ', 'brk') === S(null, ' - ', null), '15f-2: :brk scores exactly as unmodified — it is losslessly invertible');
+    ok(S(null, null, null) < S(null, ' - ', null), '15f-3: a whole-line wildcard scores lower than an anchored site');
+    ok(S(null, null, 'lower') === 0, '15f-4: a modified whole-line wildcard scores 0 — it is evidence of nothing');
+    ok(S('', '', null) < S(' with the ', ' of ', null), '15f-5: an abutting (whitespace-only) neighbour scores lower than real anchor text');
+
+    // 15g: RW._dbBuildLineMatcher
+    const built = RW._dbBuildLineMatcher(lines[0], null, false, {});
+    ok(built.slots.length === 2 && built.slots[0].name === 'desc' && built.slots[0].group === 1
+      && built.slots[1].name === 'keyword' && built.slots[1].group === 2,
+      '15g: slot names/groups line up with template order');
+    const knownBuilt = RW._dbBuildLineMatcher(lines[0], { desc: 'Concrete' }, false, {});
+    ok(knownBuilt.slots.length === 1 && knownBuilt.slots[0].name === 'keyword',
+      '15g-2: a name present in `known` compiles to a literal and produces no slot for it');
+    ok(RW._dbBuildLineMatcher(lines[4], null, false, { maxSlots: 2 }) === null,
+      '15g-3: a line needing more capture slots than maxSlots returns null');
+  }
+
+  /* ===== 16. RW._dbParseDescription — the reverse parser ===== */
+  {
+    const win = seedWin(makeStubWindow().win);
+    const RW = loadModule(win);
+    const sampleValues = {
+      desc: 'Concrete', keyword: 'Wall', source: 'schedule', word: 'height',
+      top: "-12'-0\"", bot: "-14'-0\"", thickness: '18"', where: 'the plan and notes',
+    };
+    function renderSample(values){
+      const v = Object.assign({}, values);
+      v.span = RW._dbSpan(v.top || '', v.bot || '', v.span && v.overridden ? v.span : '').value;
+      return RW._dbRender(RW._dbDefaultTemplate, v);
+    }
+
+    // 16a: byte-for-byte round trip
+    const rendered = renderSample(sampleValues);
+    const r16a = RW._dbParseDescription(RW._dbDefaultTemplate, rendered);
+    let allMatch = true;
+    for (const k of Object.keys(sampleValues)) if (r16a.values[k] !== sampleValues[k]) allMatch = false;
+    ok(allMatch, '16a: every sampled value round-trips exactly — got ' + JSON.stringify(r16a.values));
+    ok(r16a.confidence === 1, '16a-2: confidence is 1 when every strong line matched');
+    ok(r16a.missing.length === 0, '16a-3: nothing missing');
+    ok(r16a.span && r16a.span.overridden === false, '16a-4: span not flagged as an override — it matches the computed value');
+
+    // 16b: the inverse property — re-render the recovered values, compare byte-for-byte
+    const rerendered = renderSample(Object.assign({}, r16a.values, { overridden: r16a.span.overridden, span: r16a.span.text }));
+    ok(rerendered === rendered, '16b: re-rendering the recovered values reproduces the original text exactly');
+
+    // 16c: datum variant round-trips, span not an override
+    const datumValues = Object.assign({}, sampleValues, { top: 'T/WALL', bot: 'T/FOOTING' });
+    const datumRendered = renderSample(datumValues);
+    const r16c = RW._dbParseDescription(RW._dbDefaultTemplate, datumRendered);
+    ok(r16c.values.top === 'T/WALL' && r16c.values.bot === 'T/FOOTING', '16c: datum names round-trip');
+    ok(r16c.span && r16c.span.overridden === false, '16c-2: datum-fallback span not flagged as override');
+
+    // 16d: word swap round-trips (not accidentally tuned to "height")
+    const depthValues = Object.assign({}, sampleValues, { word: 'depth' });
+    const r16d = RW._dbParseDescription(RW._dbDefaultTemplate, renderSample(depthValues));
+    ok(r16d.values.word === 'depth', '16d: {word}="depth" round-trips');
+
+    // 16e: the headline proof — a multi-word desc through the ambiguous explanation run
+    const multiWord = Object.assign({}, sampleValues, { desc: 'Reinforced Concrete' });
+    const multiRendered = renderSample(multiWord);
+    const r16e = RW._dbParseDescription(RW._dbDefaultTemplate, multiRendered);
+    ok(r16e.values.desc === 'Reinforced Concrete', '16e: a multi-word desc recovers exactly, not truncated at the first space');
+    ok(r16e.values.where === 'the plan and notes', '16e-2: {where} still recovers from the same (now-resolved) explanation line');
+    const multiRerendered = renderSample(Object.assign({}, r16e.values, { overridden: r16e.span.overridden, span: r16e.span.text }));
+    ok(multiRerendered === multiRendered, '16e-3: the multi-word case round-trips byte-for-byte too');
+
+    // 16f: {where} is not truncated at its first space (multi-word, line-end greedy capture)
+    ok(r16a.values.where === 'the plan and notes', '16f: {where} recovers its full multi-word value');
+
+    // 16g: a recovered blank counts as recovered, not missing; beats a remembered value
+    const blankThickness = Object.assign({}, sampleValues, { thickness: '' });
+    const r16g = RW._dbParseDescription(RW._dbDefaultTemplate, renderSample(blankThickness));
+    ok(r16g.values.thickness === '' && r16g.recovered.indexOf('thickness') !== -1 && r16g.missing.indexOf('thickness') === -1,
+      '16g: a blank thickness is recovered as "", not reported missing');
+
+    // 16h: a name appearing only under a lossy modifier recovers the MODIFIED text (documented loss)
+    const r16h = RW._dbParseDescription('{desc:lower} only', RW._dbRender('{desc:lower} only', { desc: 'Concrete' }));
+    ok(r16h.values.desc === 'concrete', '16h: {desc:lower}-only site recovers lowercased text, not the original casing');
+
+    // 16i: negative — section 12's exact hand-written fixture recovers nothing
+    const r16i = RW._dbParseDescription(RW._dbDefaultTemplate, 'A hand-written description already here.');
+    ok(r16i.recovered.length === 0 && r16i.confidence === 0, '16i: an unrelated hand-written description recovers nothing (the wildcard-line rule)');
+
+    // 16j: negative — unrelated multi-line prose
+    const r16j = RW._dbParseDescription(RW._dbDefaultTemplate, 'Some notes.\nMore notes.\nEven more notes here.');
+    ok(r16j.confidence < 1, '16j: unrelated prose does not falsely report full confidence');
+
+    // 16k: negative — blank/missing description never throws
+    ['', null, undefined, '   '].forEach((d, i) => {
+      let threw = false, r;
+      try { r = RW._dbParseDescription(RW._dbDefaultTemplate, d); } catch (e){ threw = true; }
+      ok(!threw && r && r.recovered.length === 0, '16k-' + i + ': blank/missing description (' + JSON.stringify(d) + ') -> empty result, no throw');
+    });
+
+    // 16l: negative — blank/missing template never throws
+    [null, ''].forEach((t, i) => {
+      let threw = false, r;
+      try { r = RW._dbParseDescription(t, 'Concrete - Wall'); } catch (e){ threw = true; }
+      ok(!threw && r && r.recovered.length === 0, '16l-' + i + ': blank template (' + JSON.stringify(t) + ') -> empty result, no throw');
+    });
+
+    // 16m: partial description (only the first two lines present)
+    const r16m = RW._dbParseDescription(RW._dbDefaultTemplate, 'Concrete - Wall\nschedule');
+    ok(r16m.recovered.indexOf('desc') !== -1 && r16m.recovered.indexOf('keyword') !== -1 && r16m.recovered.indexOf('source') !== -1,
+      '16m: desc/keyword/source recovered from the two present lines');
+    ok(r16m.missing.indexOf('top') !== -1 && r16m.missing.indexOf('thickness') !== -1 && r16m.missing.indexOf('where') !== -1,
+      '16m-2: the absent lines\' names are reported missing');
+    ok(Math.abs(r16m.confidence - 0.25) < 1e-9, '16m-3: confidence reflects 1 of 4 strong lines matched — got ' + r16m.confidence);
+
+    // 16n: a hand-added extra line still lets the anchored lines recover, but the round trip is not exact
+    const withExtra = rendered + '\nP.S. see markup on sheet A-101';
+    const r16n = RW._dbParseDescription(RW._dbDefaultTemplate, withExtra);
+    ok(r16n.recovered.length === 8, '16n: an extra trailing line does not cost recovery of the 5 real template lines');
+    const r16nRerendered = renderSample(Object.assign({}, r16n.values, { overridden: r16n.span.overridden, span: r16n.span.text }));
+    ok(r16nRerendered !== withExtra, '16n-2: the extra line means the re-render is NOT byte-identical (no Fill baseline)');
+
+    // 16o: span override recovery
+    const overrideRendered = RW._dbRender(RW._dbDefaultTemplate, Object.assign({}, sampleValues, { span: '600mm' }));
+    const r16o = RW._dbParseDescription(RW._dbDefaultTemplate, overrideRendered);
+    ok(r16o.span && r16o.span.overridden === true && r16o.span.text === '600mm', '16o: a manual span override is recovered and flagged');
+    ok(r16o.values.top === sampleValues.top && r16o.values.bot === sampleValues.bot, '16o-2: top/bot still recover normally alongside an overridden span');
+
+    // 16p: {{ }} literal braces round-trip
+    const braceTpl = '{{literal}} {x}';
+    const braceRendered = RW._dbRender(braceTpl, { x: 'value' });
+    ok(braceRendered === '{literal} value', 'precondition: brace template renders as expected');
+    const r16p = RW._dbParseDescription(braceTpl, braceRendered);
+    ok(r16p.values.x === 'value', '16p: {{ }} braces are not misread as a variable during parsing');
+
+    // 16q: backtracking guard — a long adversarial line completes fast, and an over-length line is skipped
+    const t0 = Date.now();
+    RW._dbParseDescription(RW._dbDefaultTemplate, ['a', 'b', 'c', 'd', ('x '.repeat(900).trim())].join('\n'));
+    ok(Date.now() - t0 < 250, '16q: a long non-matching line completes well under 250ms (no catastrophic backtracking)');
+    const overCap = RW._dbParseDescription(RW._dbDefaultTemplate, ['a', 'b', 'c', 'd', ('y '.repeat(1200).trim())].join('\n'), { maxLineLength: 2000 });
+    ok(overCap.recovered.length === 0 || overCap.recovered.length < 8, '16q-2: an over-length line is skipped rather than matched against');
+
+    // 16r: purity — deterministic, arguments unmutated, shared VAR_RE state not leaked
+    const tplBefore = RW._dbDefaultTemplate;
+    const rA = JSON.stringify(RW._dbParseDescription(tplBefore, 'Concrete - Wall'));
+    const rB = JSON.stringify(RW._dbParseDescription(tplBefore, 'Concrete - Wall'));
+    ok(rA === rB, '16r: two identical calls return identical results');
+    ok(RW._dbDefaultTemplate === tplBefore, '16r-2: the template argument is not mutated');
+    ok(RW._dbParseTemplate(RW._dbDefaultTemplate).length === 8, '16r-3: RW._dbParseTemplate still works correctly after a parse (VAR_RE.lastIndex not left dirty)');
+
+    // 16s: bracket-specific — a description written under the OLD always-bracket template recovers
+    // top/bot UNBRACKETED, and a positive pair round-trips with no brackets at all.
+    const oldStyleDesc = [
+      'Concrete - Wall', 'schedule', 'height: [12\'-0"] - [10\'-0"]', 'thickness: 18"',
+      'explanation: The detail shows an 18" concrete wall with the height of 2\'-0". the thickness can be found in schedule table within the same page while the height can be found in the plan and notes',
+    ].join('\n');
+    const r16s = RW._dbParseDescription(RW._dbDefaultTemplate, oldStyleDesc);
+    ok(r16s.values.top === "12'-0\"" && r16s.values.bot === "10'-0\"",
+      '16s: an old always-bracketed description recovers top/bot unbracketed');
+    const positiveValues = Object.assign({}, sampleValues, { top: "12'-0\"", bot: "10'-0\"" });
+    const positiveRendered = renderSample(positiveValues);
+    ok(positiveRendered.indexOf('height: 12\'-0" - 10\'-0"') !== -1, '16s-2: re-rendering a positive pair yields no brackets at all');
+    ok(positiveRendered.indexOf('[') === -1, '16s-3: no bracket character anywhere in a fully-positive render');
+  }
+
+  /* ===== 17. The seam and the UI: Edit prefills, Create doesn't, Clear/Re-read, span override ===== */
+  {
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    // Build the rendered description with a throwaway module instance first (RW._dbRender/_dbSpan
+    // are pure — safe to call before the real modal-driving instance below is even created).
+    const helperWin = seedWin(makeStubWindow().win);
+    const RWHelper = loadModule(helperWin);
+    const sample = {
+      desc: 'Concrete', keyword: 'Wall', source: 'schedule', word: 'height',
+      top: "-12'-0\"", bot: "-14'-0\"", thickness: '18"', where: 'the plan and notes',
+    };
+    sample.span = RWHelper._dbSpan(sample.top, sample.bot, '').value;
+    const rendered = RWHelper._dbRender(RWHelper._dbDefaultTemplate, sample);
+
+    const modal = makeFakeLabelModal(win, { title: 'Edit Label', description: rendered });
+    const RW = loadModule(win);
+    ok(win.document.getElementById('rw-db-field-desc').value === 'Concrete', '17a: an Edit modal prefills a field from the existing description');
+    ok(win.document.getElementById('rw-db-field-thickness').value === '18"', '17a-2: another field prefills too');
+    ok(win.document.getElementById('rw-db-preview').innerText === rendered, '17b: the preview matches the original description byte-for-byte right after open');
+    ok(win.document.getElementById('rw-db-prefill-status').innerText.indexOf('preview matches it exactly') !== -1,
+      '17b-2: the status line confirms the exact match');
+
+    // 17o: the prefill path never writes the host textarea and never submits
+    const descInp = modal.querySelector('#label-description');
+    ok(descInp.value === rendered, '17o: #label-description is untouched by prefilling (still exactly what was there)');
+    ok(!win._submitClicked, '17o-2: prefilling never clicks #label-submit-btn');
+
+    // 17e: status names the count, Clear visible
+    ok(win.document.getElementById('rw-db-prefill-status').innerText.indexOf('read all 8 fields') !== -1,
+      '17e: status reports all 8 fields read');
+    ok(win.document.getElementById('rw-db-prefill-clear').style.display !== 'none', '17e-2: Clear button visible after a successful prefill');
+
+    // 17f: Clear blanks every field, hides the row, leaves the host textarea untouched
+    win.document.getElementById('rw-db-prefill-clear')._fire('click', {});
+    ok(win.document.getElementById('rw-db-field-desc').value === '', '17f: Clear blanks a prefilled field');
+    ok(win.document.getElementById('rw-db-prefill-wrap').style.display === 'none', '17f-2: Clear hides the status row');
+    ok(RW._dbSpanOverridden === false && RW._dbPrefillBaseline === '', '17f-3: Clear resets span-override and baseline state');
+    ok(descInp.value === rendered, '17f-4: Clear never touches the host\'s own Description field');
+
+    // 17m: the prefill row is visible in Simple mode (not gated by Advanced)
+    ok(win.document.getElementById('rw-db-template-wrap').style.display === 'none', 'precondition: Simple mode is the default');
+  }
+  {
+    // 17c: a Create modal with the very same rendered text sitting in the textarea does NOT prefill
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    const helperWin = seedWin(makeStubWindow().win);
+    const RWHelper = loadModule(helperWin);
+    const sample = { desc: 'Concrete', keyword: 'Wall', source: 'schedule', word: 'height', top: "-12'-0\"", bot: "-14'-0\"", thickness: '18"', where: 'the plan and notes' };
+    sample.span = RWHelper._dbSpan(sample.top, sample.bot, '').value;
+    const rendered = RWHelper._dbRender(RWHelper._dbDefaultTemplate, sample);
+    makeFakeLabelModal(win, { title: 'Create New Label', description: rendered });
+    const RW = loadModule(win);
+    ok(win.document.getElementById('rw-db-field-desc').value === '', '17c: a Create modal never prefills, even with text already in the textarea');
+    ok(win.document.getElementById('rw-db-prefill-wrap').style.display === 'none', '17c-2: the prefill status row stays hidden on Create');
+  }
+  {
+    // 17d: unparseable description -> blank, status explains, Clear hidden
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Edit Label', description: 'A hand-written description already here.' });
+    const RW = loadModule(win);
+    ok(win.document.getElementById('rw-db-field-desc').value === '', '17d: an unparseable description leaves fields blank');
+    ok(win.document.getElementById('rw-db-prefill-status').innerText.indexOf('does not match') !== -1, '17d-2: status explains it could not match');
+    ok(win.document.getElementById('rw-db-prefill-clear').style.display === 'none', '17d-3: Clear is hidden — nothing to clear');
+  }
+  {
+    // 17g/17h: a modal reopen re-prefills from whatever's there NOW, and Create after Edit stays blank
+    let win = seedWin(makeStubWindow().win);
+    const MO = makeMutationObserverStub();
+    win.MutationObserver = MO;
+    const modal = makeFakeLabelModal(win, { title: 'Edit Label', description: 'Concrete - Wall\nschedule' });
+    const RW = loadModule(win);
+    ok(win.document.getElementById('rw-db-field-desc').value === 'Concrete', 'precondition: first Edit open prefilled desc');
+
+    modal.hidden = true; MO._instances[0].trigger();
+    modal.querySelector('#label-modal-title').textContent = 'Edit Label';
+    modal.querySelector('#label-description').value = 'CMU - Footing';
+    modal.hidden = false; MO._instances[0].trigger();
+    ok(win.document.getElementById('rw-db-field-desc').value === 'CMU', '17g: reopening on a DIFFERENT Edit description prefills the new values, not the old');
+    ok(win.document.getElementById('rw-db-field-keyword').value === 'Footing', '17g-2: the other recovered field also updated');
+
+    modal.hidden = true; MO._instances[0].trigger();
+    modal.querySelector('#label-modal-title').textContent = 'Create New Label';
+    modal.hidden = false; MO._instances[0].trigger();
+    ok(win.document.getElementById('rw-db-field-desc').value === '', '17h: reopening as Create after an Edit prefill still starts blank');
+    ok(win.document.getElementById('rw-db-prefill-wrap').style.display === 'none', '17h-2: the status row is hidden on that Create open too (no stale text from the prior Edit)');
+  }
+  {
+    // 17i: RW._dbRememberValues fills in whatever the prefill itself missed, and the status
+    // reports both counts. Reuses ONE modal element throughout (as 17g/17h do) — a hidden->visible
+    // transition on the SAME #label-modal is exactly what a real re-open of the host's dialog
+    // looks like to this add-on's observer.
+    let win = seedWin(makeStubWindow().win);
+    const MO = makeMutationObserverStub();
+    win.MutationObserver = MO;
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    RW._dbRememberValues = true;
+
+    // First label: fill EVERY field with a real (non-blank) value, then Fill with remembering on
+    // — so RW._dbLastValues ends up with a genuinely useful value for every name, not blanks.
+    const firstValues = {
+      desc: 'CMU', keyword: 'Beam', source: 'detail', word: 'depth',
+      top: "-1'-0\"", bot: "-2'-0\"", thickness: '8"', where: 'the roof plan',
+    };
+    for (const name of Object.keys(firstValues)){
+      const el = win.document.getElementById('rw-db-field-' + name);
+      el.value = firstValues[name];
+      el._fire('input', {});
+    }
+    win.document.getElementById('rw-db-fill')._fire('click', {});
+    ok(RW._dbLastValues && RW._dbLastValues.where === 'the roof plan', 'precondition: remembering captured the first label\'s values');
+
+    // Second label (Edit): only lines 1-2 present, so desc/keyword/source are recovered from the
+    // description itself; top/bot/thickness/where are missing from it and should fall back to
+    // the remembered values from the first label.
+    modal.hidden = true; MO._instances[0].trigger();
+    modal.querySelector('#label-modal-title').textContent = 'Edit Label';
+    modal.querySelector('#label-description').value = 'CMU - Slab\nplan and notes';
+    modal.hidden = false; MO._instances[0].trigger();
+
+    ok(win.document.getElementById('rw-db-field-desc').value === 'CMU', '17i: desc recovered from the description itself');
+    ok(win.document.getElementById('rw-db-field-where').value === 'the roof plan', '17i-2: a name the prefill missed falls back to the remembered value');
+    const statusText = win.document.getElementById('rw-db-prefill-status').innerText;
+    ok(statusText.indexOf('from the previous label') !== -1, '17i-3: the status line discloses that some fields came from the previous label, not this description');
+  }
+  {
+    // 17j: span-override ordering — the recovered override must survive RW._dbResetFields' own
+    // clearing, which runs first (see applyPrefill).
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    const helperWin = seedWin(makeStubWindow().win);
+    const RWHelper = loadModule(helperWin);
+    const sample = { desc: 'Concrete', keyword: 'Wall', source: 'schedule', word: 'height', top: "-12'-0\"", bot: "-14'-0\"", thickness: '18"', where: 'the plan and notes', span: '600mm' };
+    const rendered = RWHelper._dbRender(RWHelper._dbDefaultTemplate, sample);
+    makeFakeLabelModal(win, { title: 'Edit Label', description: rendered });
+    const RW = loadModule(win);
+    ok(RW._dbSpanOverridden === true, '17j: a manual span override in the description is recovered');
+    const overrideInput = win.document.getElementById('rw-db-span-override-input');
+    ok(!!overrideInput && overrideInput.value === '600mm', '17j-2: the override input shows the recovered text');
+    ok(!win.document.getElementById('rw-db-span-display'), '17j-3: the computed-span display is not shown while overridden');
+  }
+  {
+    // 17k: Edit still requires two clicks on Fill even when the description was prefilled exactly
+    // (the guard is unchanged this round — see CLAUDE.md "Deferred").
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    const helperWin = seedWin(makeStubWindow().win);
+    const RWHelper = loadModule(helperWin);
+    const sample = { desc: 'Concrete', keyword: 'Wall', source: 'schedule', word: 'height', top: "-12'-0\"", bot: "-14'-0\"", thickness: '18"', where: 'the plan and notes' };
+    sample.span = RWHelper._dbSpan(sample.top, sample.bot, '').value;
+    const rendered = RWHelper._dbRender(RWHelper._dbDefaultTemplate, sample);
+    const modal = makeFakeLabelModal(win, { title: 'Edit Label', description: rendered });
+    const RW = loadModule(win);
+    const descInp = modal.querySelector('#label-description');
+    win.document.getElementById('rw-db-fill')._fire('click', {});
+    ok(descInp.value === rendered, '17k: the first click on an exactly-prefilled Edit modal still only asks');
+    ok(win.document.getElementById('rw-db-fill').innerText === 'Overwrite?', '17k-2: the button still relabels to Overwrite?');
+    win.document.getElementById('rw-db-fill')._fire('click', {});
+    ok(descInp.value === rendered, '17k-3: a second click commits — text is unchanged since it round-trips exactly');
+  }
+  {
+    // 17n: Re-read parses against the CURRENT #rw-db-template, not the default
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Edit Label', description: 'rebar: #5 @ 12" o.c.' });
+    const RW = loadModule(win);
+    ok(win.document.getElementById('rw-db-prefill-status').innerText.indexOf('does not match') !== -1,
+      'precondition: the default template does not match this custom-looking description');
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {}); // reveal the template box
+    const templateEl = win.document.getElementById('rw-db-template');
+    templateEl.value = 'rebar: {rebar}';
+    templateEl._fire('input', {});
+    win.document.getElementById('rw-db-prefill-reread')._fire('click', {});
+    ok(win.document.getElementById('rw-db-field-rebar').value === '#5 @ 12" o.c.', '17n: Re-read against a custom template recovers its own field');
+  }
+  {
+    // 17p: RW._dbPrefillStatusText wordings, pure
+    let win = seedWin(makeStubWindow().win);
+    const RW = loadModule(win);
+    ok(RW._dbPrefillStatusText({}, false, 0) === 'this description does not match the template — fields left blank',
+      '17p: not-applied wording');
+    ok(RW._dbPrefillStatusText({ recovered: ['a', 'b'], missing: [], weak: [] }, true, 0) === 'read all 2 fields from the existing description',
+      '17p-2: all-recovered wording');
+    ok(RW._dbPrefillStatusText({ recovered: ['a'], missing: ['b'], weak: [] }, true, 0) === 'read 1 of 2 fields from the existing description — blank: b',
+      '17p-3: partial wording names the blanks');
+    ok(RW._dbPrefillStatusText({ recovered: ['a'], missing: [], weak: ['a'] }, true, 0).indexOf('double-check: a') !== -1,
+      '17p-4: weak wording flags a site to double-check');
+    ok(RW._dbPrefillStatusText({ recovered: ['a'], missing: ['b'], weak: [] }, true, 2).indexOf('(2 from the previous label)') !== -1,
+      '17p-5: remembered wording names the count');
   }
 
   console.log((pass + fail) + ' tests, ' + pass + ' passed, ' + fail + ' failed');
