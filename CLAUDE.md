@@ -789,6 +789,23 @@ fixtures here, or trigger the override auto-engage more often than expected; and
 `localStorage`'s JSON round-trip behaves identically on the real page for a genuinely large
 collection of templates (no reason to expect otherwise, but not directly observed).
 
+## Round 7 — the template picker is unconditionally visible in Simple mode
+
+Requested directly: "make it that the template drop down to be visible in simple mode also."
+Round 6 shipped the picker gated to show in Simple mode only once `RW._dbTemplates.length > 1` —
+reasoning that a one-option dropdown was noise on a fresh install. That reasoning is superseded:
+the picker (and, implicitly, that Save-as-new/Rename/Delete exist behind Advanced) is worth seeing
+even with only `"Default"` saved, so `RW._dbApplyTemplateSelectVisibility` now sets
+`wrap.style.display = ''` unconditionally, in both Simple and Advanced, regardless of collection
+size — a one-line change; no other call site needed to change, since
+`RW._dbRenderTemplateSelect`/`RW._dbApplyAdvancedVisibility` already call this function at the
+right times.
+
+Spot-checked: reverted to round 6's length-gated version and confirmed exactly `20p` (the picker
+visibility test, rewritten this round to assert "shown" instead of "hidden" for the one-template
+case) failed, nothing else — restored. `node --check` passes; `desc_loader.js` rebuilt clean
+(88321 bytes) and reconfirmed free of any control byte.
+
 ## Constraints (do not violate)
 
 - Console injection only — no build step, no config file, no install step on the annotator's end.

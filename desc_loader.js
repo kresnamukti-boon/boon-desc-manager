@@ -1061,13 +1061,13 @@
   /* ---------- template selection + management (round 6: a named collection, not one saved
      template) ---------- */
 
-  // The picker shows in Simple mode too — picking a source template is an everyday action — but
-  // only once there's a real choice to make; a single-entry dropdown is pure noise, so Simple
-  // mode stays byte-identical for anyone who never adds a template. Always shown in Advanced.
+  // Round 7: unconditionally shown in Simple mode too, not just once there's a second template —
+  // picking a source template (or noticing Save-as-new exists) is an everyday action even with
+  // only "Default" saved. Superseded round 6's own length-gated version.
   RW._dbApplyTemplateSelectVisibility = function(){
     const wrap = document.getElementById('rw-db-tplsel-wrap');
     if (!wrap) return;
-    wrap.style.display = (RW._dbAdvanced || RW._dbTemplates.length > 1) ? '' : 'none';
+    wrap.style.display = '';
   };
 
   // Rebuilds #rw-db-template-select's <option>s from RW._dbTemplates and syncs its value to the
@@ -1421,8 +1421,8 @@
     // entirely out of the way (down to a single thin strip) without removing it.
     const body = mkEl('div', { id: 'rw-db-body' });
 
-    // Template picker — FIRST in body, before the template box itself. Visible in Simple mode too
-    // (see RW._dbApplyTemplateSelectVisibility) once there's more than one saved template.
+    // Template picker — FIRST in body, before the template box itself. Unconditionally visible in
+    // Simple mode too (see RW._dbApplyTemplateSelectVisibility), even with only one template saved.
     const tplSelWrap = mkEl('div', { id: 'rw-db-tplsel-wrap' }, 'margin-bottom:4px;display:flex;align-items:center;gap:4px;');
     tplSelWrap.appendChild(mkEl('span', { innerText: 'template' }, 'font-size:10px;opacity:0.75;min-width:50px;'));
     const tplSelect = mkEl('select', { id: 'rw-db-template-select' }, 'flex:1;font-size:11px;');

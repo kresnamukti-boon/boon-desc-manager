@@ -1575,25 +1575,26 @@ async function main(){
     ok(win.document.getElementById('rw-db-template-select').value === 'SourceB',
       '20o-4: a Create modal never runs auto-detect — the active template is unchanged');
   }
-  // 20p: picker visibility — hidden in Simple with one template, shown in Advanced regardless,
-  // shown in Simple once a second template exists.
+  // 20p: picker visibility (round 7) — shown unconditionally in Simple mode, even with only one
+  // template, shown in Advanced regardless, and still shown in Simple after adding a second
+  // template (never accidentally hidden by anything else in the toggle/save-as path).
   {
     let win = seedWin(makeStubWindow().win);
     win.MutationObserver = makeMutationObserverStub();
     makeFakeLabelModal(win, { title: 'Create New Label' });
     const RW = loadModule(win);
-    ok(win.document.getElementById('rw-db-tplsel-wrap').style.display === 'none',
-      '20p: the picker is hidden in Simple mode with only one template');
+    ok(win.document.getElementById('rw-db-tplsel-wrap').style.display === '',
+      '20p: the picker is shown in Simple mode even with only one template');
 
     win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
     ok(win.document.getElementById('rw-db-tplsel-wrap').style.display === '',
-      '20p-2: the picker is always shown in Advanced mode');
+      '20p-2: the picker is shown in Advanced mode too');
 
     win.document.getElementById('rw-db-tpl-name').value = 'B';
     win.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
     win.document.getElementById('rw-db-adv-toggle')._fire('click', {}); // back to Simple
     ok(win.document.getElementById('rw-db-tplsel-wrap').style.display === '',
-      '20p-3: once a second template exists, the picker shows in Simple mode too');
+      '20p-3: still shown in Simple mode after a second template is added');
   }
 
   /* ===== 21. Round 6 — whole-description override ===== */
