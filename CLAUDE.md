@@ -30,7 +30,7 @@ synthetic harness `verify_desc.js` is the whole verification story.
 ```bash
 bash build_loader.sh          # rebuilds desc_loader.js (runs node --check on the result)
 node --check rw_descbuilder.js
-node verify_desc.js           # synthetic harness — 380 tests, all passing
+node verify_desc.js           # synthetic harness — 520 tests, all passing
 ```
 
 To actually verify a change works, it has to be pasted into a real annotation-job page in Chrome
@@ -239,8 +239,12 @@ a direct port, not a reinvention:
   **Except** when `RW._ocrBoxDrawing` (round 5, `boon-ocr`'s shared flag for its OCR Box gesture)
   was observed true while hidden — see round 5 above for why that transition must NOT count as a
   real reopen, and why the flag can't be checked at the moment visibility is restored.
-- **Mount point**: `descInp.insertAdjacentElement('beforebegin', root)` — directly above
-  Description, never touching `boon-ocr`'s own controls (which mount `afterend`, on the far side).
+- **Mount point (round 10 made this conditional)**: `RW._dbPositionPanel(modal)` decides, once per
+  fresh open, between two modes. **Inline** (the original, and still the fallback on a narrow
+  viewport): `descInp.insertAdjacentElement('beforebegin', root)` — directly above Description,
+  never touching `boon-ocr`'s own controls (which mount `afterend`, on the far side). **Floating**
+  (when there's room to the modal's right): `document.body.appendChild(root)` with
+  `position:fixed`, docked just past the modal's own right edge — see round 10 below.
 - **Style**: one injected `<style id="rw-db-style">` setting both `color` and `background`
   explicitly on every field — the lesson of `boon-label-management`'s own round 2 (Tailwind
   preflight's `color:inherit` produced invisible white-on-white fields there); the host modal here
@@ -995,6 +999,311 @@ triggers any of this.
 embedded-thickness format (not requested, not built — only `bot` is special-cased); and whether
 the specific separator `" - "` (space-hyphen-space) ever collides with some other bot convention
 not yet seen in practice.
+
+## Round 10 — float the panel beside the modal instead of pushing content down
+
+Requested directly: every row this panel adds pushed the host modal's own content down, and with
+multiple templates/fields it could consume a lot of vertical space even under the existing 40vh
+cap. Confirmed with the user: when there's room, dock the panel beside the modal's **right edge**
+instead — attached to the modal (appears/disappears with it, computed once per open, not
+continuously tracked), not a fully independent always-on floating panel. Falls back to today's
+exact inline mount on a narrow viewport.
+
+`boon-label-management`'s own floating panel (`rw_labelmgr.js`) is the family precedent for *how*
+to float one: `document.body` mount, `position:fixed`, explicit `top`/`left` (that repo hit a real
+bug once where a fixed-position element with no anchor at all fell back to its static position and
+rendered fully off-screen — its own regression test, `4g`, is exactly what round 10's `24b-3`
+mirrors), and a `z-index` near the 32-bit max (`2147483646`, the same constant, reused here). It
+has **no precedent for host-state-synced visibility** — that repo's panel is unconditionally
+always-on, built once at paste time; this repo's panel must show/hide exactly when the modal does,
+which it got for free as a DOM descendant until this round, and genuinely new machinery
+(`RW._dbApplyPanelVisibility`) had to be added to keep that true once it can float outside it.
+
+### The decision: `RW._dbPositionPanel(modal)`, called once per fresh open
+
+```js
+RW._dbFloatWidth = RW._dbFloatWidth != null ? RW._dbFloatWidth : 320;
+RW._dbFloatGap = RW._dbFloatGap != null ? RW._dbFloatGap : 12;
+```
+
+Computes `window.innerWidth - modal.getBoundingClientRect().right`; floats (`document.body`
+mount, `position:fixed`, explicit `top`/`left`/`width`/`max-height`/`z-index`) when that's
+`>= RW._dbFloatWidth + RW._dbFloatGap`, otherwise falls back to the original inline mount. Called
+from `onLabelModalMutation`'s existing fresh-open branch (`nowVisible && !dbWasVisible`) — never
+on a `resize` listener, never re-checked while the modal stays open — which is what "computed once
+per open" (the user's own choice) means in practice; no extra machinery was needed to *avoid*
+continuous tracking, just calling it from the right place once. Both branches unconditionally
+re-parent (`appendChild`/`insertAdjacentElement` are safe no-ops when already in place).
+
+### Four `modal.querySelector('#rw-db-…')` calls were a latent bug, exposed by floating
+
+Every `modal.querySelector` call site in the file was read before writing a line of round 10:
+five read a *host* element (`#label-description`, `#label-modal-title`) and were correctly left
+alone; **four read one of this add-on's own elements**, which silently return `null` the moment
+the panel floats outside the modal:
+
+- `RW._dbBuildPanel`'s idempotency guard — the most serious: once floated, this check would always
+  miss and a **second panel gets built on the next open**. Confirmed exactly this via spot-check
+  (below).
+- `RW._dbRunFill`'s button lookup — breaks the two-click "Overwrite?" relabeling.
+- `RW._dbResetFields`'s template-box and Fill-button lookups — breaks the template reset and the
+  Fill label reset on every fresh open.
+
+All four became `document.getElementById(...)` — ids are already unique page-wide (this file's own
+existing convention), so this is a pure widening, not a behavior change for the inline case. This
+is exactly the discipline `boon-label-management`'s own `#label-description` write already relies
+on from outside its host modal.
+
+### `RW._dbApplyPanelVisibility` — the one thing being a descendant used to give for free
+
+```js
+RW._dbApplyPanelVisibility = function(modal){
+  const root = document.getElementById('rw-db-root');
+  if (!root) return;
+  root.style.display = modalVisible(modal) ? '' : 'none';
+};
+```
+
+Called unconditionally at the end of `onLabelModalMutation`, every mutation. Harmless when inline
+(a hidden ancestor already hides its descendants; this is a no-op there in effect). Load-bearing
+only when floating, where the root is a `document.body` sibling and gets no visibility inheritance
+from the modal at all. Deliberately **not** gated by the `RW._ocrBoxDrawing` skip-reset latch —
+that latch protects *field values* from a transient OCR-Box-induced hide, unrelated to the panel's
+own show/hide, and the host's own modal genuinely does blink hidden during that gesture, so the
+panel blinking with it is the visually consistent behavior, not a bug to guard against.
+
+### Test harness: one shared stub default changed, plus two real stub bugs it exposed
+
+`getBoundingClientRect()`'s stub default changed from `{width:100}` to `rect(0,0,1200,100)`
+(matching the stub's own `innerWidth:1200`) so `available` comes out to exactly `0` by default —
+**every existing test keeps mounting inline, unchanged**; new round-10 tests override
+`modal.getBoundingClientRect` per-test to simulate room to float. Confirmed by grep that nothing
+existing read the old default, so this was a safe, zero-blast-radius change.
+
+Two real, previously-latent stub bugs surfaced immediately by writing the first floating test:
+
+1. **`getBoundingClientRect()` didn't include `.right`/`.bottom`.** A real `DOMRect` computes these
+   from `left`/`top`/`width`/`height` automatically; a plain object literal doesn't. `RW._dbPositionPanel`
+   reads `.right`, which came back `undefined` in every test, silently forcing `NaN >= ...` (always
+   false) — every scenario fell back to inline regardless of the rect the test set up, and every
+   assertion expecting a float failed the same way, masking the real signal entirely until traced
+   by hand. Fixed with a shared `rect(left, top, width, height)` helper that computes both, used by
+   the stub's own default and every test override — never in the product code, which correctly
+   already assumed a real `DOMRect`.
+2. **`appendChild`/`insertBefore`/`insertAdjacentElement` didn't remove the node from its current
+   parent first.** A real DOM node has exactly one parent at a time — re-inserting an
+   already-placed node *moves* it. The stub just spliced it into the new position, leaving the old
+   `_children` entry in place too — invisible until `RW._dbPositionPanel` became the first code in
+   this repo's history to unconditionally re-parent the *same* node on every open (previously,
+   nothing ever re-inserted an element that was already exactly where it needed to be). Manifested
+   as two existing tests (`9b`, `14c`) suddenly failing the moment `RW._dbPositionPanel` was wired
+   in, even before any round-10-specific test existed. Fixed with a `detachFromParent(node)` helper
+   called at the top of all three insertion methods.
+
+New section 24 covers: the default (no-room) case mounting inline, unchanged; a floating scenario
+asserting `document.body` parentage, `position:fixed`, and — the sibling repo's own hard-won
+lesson — both `top` and `left` explicitly non-empty; Fill, the "Reset to default" button, and a
+genuine reopen's own field-reset all still working while floating (the four-lookup regression,
+each isolated and confirmed independently — see below); `RW._dbApplyPanelVisibility` hiding/showing
+with the modal; position computed once per open, not on an unrelated mutation; and
+`RW._dbBuildPanel`'s idempotency guard holding after floating (no duplicate panel).
+
+**Spot-checked, one fix at a time — a real lesson from the first attempt**: reverting all four
+`document.getElementById` fixes *together* produced a false negative — with `RW._dbBuildPanel`'s
+own guard also broken, every reopen silently builds a brand-new, freshly-defaulted panel, which
+*accidentally* makes `RW._dbResetFields`'s own (separately broken) reset look like it's working,
+since a fresh element already starts at the default value regardless of whether any reset code
+ran. Caught by two of the new tests (`24c-4`/`24c-5`) passing when they should have failed.
+**Fixed the test, not by trusting the plan's grouping**: reverted each of the four sites
+**individually** instead — `RW._dbResetFields`'s two lookups alone → exactly `24c-4`/`24c-5` fail;
+`RW._dbRunFill`'s alone → exactly `24c-2`; `RW._dbBuildPanel`'s guard alone → `24d-2`/`24e-2`/`24f`
+(a broader break, since duplicate panels cascade into visibility and positioning too — expected,
+not a bug). Also confirmed independently: removing the `RW._dbApplyPanelVisibility` call → exactly
+`24d`; moving `RW._dbPositionPanel` to run on every mutation instead of only the fresh-open edge →
+exactly `24e`. `node --check` passes; `desc_loader.js` rebuilt clean (103873 bytes) and reconfirmed
+free of any control byte.
+
+**`verify_desc.js` — grew from 380 to 402 tests.**
+
+**Not yet live-verified**: whether 320px plus the modal's own real width leaves enough room on a
+typical annotator's screen (chosen conservatively, not measured against the real host page); and
+whether the host modal's own `position`/any ancestor `transform` ever changes what
+`getBoundingClientRect()`'s coordinates mean in a way `position:fixed` (which is relative to the
+viewport, or to the nearest transformed ancestor if one exists) wouldn't expect.
+
+## Round 11 — "Save as new" can overwrite an existing template, with a two-click confirm
+
+Requested directly, prompted by a moment of confusion: an accidental template edit had quietly
+dropped `{bot}` from the active template, and it was already auto-saved — round 6's own "every
+edit saves immediately" design has no undo, and there was no way to deliberately replace an
+*existing* saved template's text with what's in the box; typing an existing name into "Save as
+new" simply refused outright. Confirmed with the user: extend "Save as new" so that typing a name
+that already belongs to another template offers to **overwrite** it instead of refusing — using
+the exact two-click idiom `RW._dbRunFill`'s own "Overwrite?" guard on the Fill button already
+established in this file, rather than inventing a separate confirm dialog.
+
+### The mechanism, reusing an existing idiom rather than a new one
+
+`RW._dbSaveTemplateAs`: a name that doesn't match anything saves immediately, unchanged from round
+6. A name that *does* match another entry (case-insensitively — same rule Save-as-new/Rename
+already used for duplicate detection) arms instead of refusing: the button relabels to
+"Overwrite?", inline status names which template would be replaced, and a second click on the
+*same* target name commits (replaces that entry's `text`, selects it). `RW._dbSaveAsArmed`/
+`RW._dbSaveAsArmedName` track the pending target; `RW._dbCancelSaveAsArm()` is the one place that
+gets undone — called whenever the armed state should no longer apply: typing a *different* name
+(the box's own `input` listener), switching the active template (`RW._dbSetActiveTemplate`, so
+picking a template from the dropdown mid-arm doesn't leave a stale confirmation pointed at a name
+that's no longer even relevant), a fresh modal open (`RW._dbResetFields`, matching how
+`RW._dbFillArmed` already resets there), or the same 3-second timeout window `RW._dbRunFill` uses.
+Clicking the button again with the *same* name mid-arm is what actually commits — anything else
+just re-arms fresh for whatever the new target is.
+
+**Duplicate detection was split into two pieces** to make this possible: `dbValidTemplateNameBasic`
+(blank / over-40-characters only) is now shared by Save-as-new and Rename; the existing-name check
+moved into a separate `dbFindTemplateByNameCI(name, ignoreName)`, called differently by each —
+Save-as-new arms instead of refusing; **Rename is deliberately unchanged**, still refusing a
+duplicate outright, since renaming to merge two templates into one is a different, more involved
+operation than this round was asked to build.
+
+**A real bug caught by writing the tests, not assumed away**: the first draft put "clear
+`#rw-db-tpl-status`" inside `RW._dbCancelSaveAsArm()` unconditionally — which then *wiped out* the
+validation error `dbValidTemplateNameBasic` had just written on the invalid-name path, since that
+path also calls into the same cancel logic to reset the armed button. Caught by test `25g`
+initially failing for the *opposite* reason expected (status wasn't clearing on a legitimate
+re-type) while probing the fix, which surfaced the ordering conflict. **Fixed** by splitting
+`RW._dbCancelSaveAsArm()` into two layers: a private `dbResetSaveAsButton()` (arm flags, timer,
+button label only — never touches status) that the invalid-name path calls directly, and the
+public `RW._dbCancelSaveAsArm()` (calls the former, then also clears status) for every other
+caller, none of which have a status message of their own to protect.
+
+Spot-checked, each mechanism in isolation: disabling the two-click gate (always committing on the
+first click) broke 11 of the new tests, confirming it's genuinely load-bearing throughout; removing
+the name-input's own cancel-on-type listener broke exactly `25g`/`25g-2`; removing
+`RW._dbSetActiveTemplate`'s cancel-arm call broke exactly `25h` (and only `25h` — `25i`, the reopen
+case, is a separate code path and stayed green, confirming the two are properly independent);
+removing `RW._dbResetFields`'s own cancel-arm call broke exactly `25i`. `node --check` passes;
+`desc_loader.js` rebuilt clean (107594 bytes) and reconfirmed free of any control byte.
+
+**`verify_desc.js` — grew from 402 to 429 tests.** New section 25: a genuinely new name still
+saves immediately (regression guard); the full two-click arm/confirm/commit cycle, including that
+the collection gains no duplicate entry; changing the typed name between clicks re-arms for the
+new target rather than confirming the old one; typing anything cancels the arm outright; switching
+templates or reopening the modal both cancel a pending arm; the duplicate check is
+case-insensitive; overwriting the active template's own name works harmlessly; and Rename is
+completely unaffected — still refuses a duplicate outright, with no arm/relabel state of its own.
+
+**Not yet live-verified**: the "Overwrite?" relabeling's legibility next to the other
+already-established Save as new/Rename/Delete/Reset row inside the real, Tailwind-styled modal
+(proven only against the synthetic stub).
+
+## Round 12 — user-definable formula fields
+
+Prompted by a question about whether `{span}` could be shown as an equation, which surfaced the
+real ask, confirmed with the user: a general way to define a new computed field from a simple
+expression — type `{total} = {a} + {b}` in Advanced mode and `{total}` then renders a computed
+value like `{span}` already does, usable in **any** saved template, not tied to one. Scope
+confirmed explicitly: a strict left-to-right `+`/`-` chain over `{name}` tokens only — no
+parentheses, no precedence, no `*`/`/`, no literal numbers (`{net} = {top} - 6"` is out of scope;
+a real field is the workaround); a formula's operands must be plain fields or the existing
+`{span}`/`{a}` derived names, never another formula — so there is no dependency ordering or cycle
+handling to build at all; formulas persist across a reload as their own global collection, exactly
+like the template collection already does, but not tied to any one template.
+
+### The load-bearing decision: one shared render function, not two
+
+`RW._dbComputeOutput` (the live DOM path) and `RW._dbDetectTemplate` (round 6's auto-detect, which
+independently reconstructs `values` and re-renders for its own exact-match check) were the *only
+two* call sites that ever reached `RW._dbRender` — confirmed by reading every call site during
+planning, not assumed. Both need the identical three-step pipeline (inject computed values →
+render → apply round 8's NS substitution), and round 9 already proved what duplicating that
+invites: `RW._dbDetectTemplate` was found *missing* the NS fix mid-round, purely because it was a
+second hand-written copy of the same logic. Rather than add a formula-injection step to both
+copies — repeating that exact mistake one round after fixing it — this round retires the pattern:
+`RW._dbRenderFinal(templateText, values)` is now the one function both call sites share (`values`
+must already carry `span` before the call; computing that stays at each call site, since the two
+callers legitimately derive it differently — a live span override plus the span row, vs. whatever
+the reverse parser recovered). The regression this exists to prove — `RW._dbDetectTemplate`
+reporting an exact match for a description containing a formula's own computed value — is
+`verify_desc.js` test **26y**, and the two-part spot-check below is what actually demonstrates the
+sharing matters, rather than just asserting it.
+
+### `BUILTIN_DERIVED_NAMES` vs. `DERIVED_NAMES`
+
+Splitting these in two (`BUILTIN_DERIVED_NAMES = { span: true, a: true }`, the genuinely-reserved
+set, vs. `DERIVED_NAMES`, the render/parse exclusion set `RW._dbParseTemplate` already reads, now
+`BUILTIN_DERIVED_NAMES` plus every current formula name) exists to avoid a real, user-visible
+wording bug: reusing the merged set for the reserved-name refusal would tell someone defining
+`{total} = {a} + {b}` a second time that `"total" is reserved`, which would be true only by an
+implementation accident — `total` isn't reserved at all, it's merely *already taken* by another
+formula, a completely different refusal with its own message (`dbSyncFormulaDerivedNames()` keeps
+`DERIVED_NAMES` in sync with the live formula list from one idempotent function, rather than
+scattered add/delete calls that could drift out of sync with each other).
+
+### Two traps the Plan-agent design review caught before any code existed
+
+Both are formulas that *validate cleanly* and then can never produce anything but blank, forever —
+exactly the shape of bug that's easy to ship because nothing about defining the formula itself
+looks wrong:
+- **Self-reference**: `{t} = {t} + {x}` — `t` becomes a derived name the instant it's accepted, so
+  it can never again get a real field of its own to sum; refused explicitly (`a formula can't use
+  its own name`) rather than left to silently evaluate to blank forever.
+- **Chaining, checked in both directions**: a formula's operand must never itself be a formula
+  (the obvious direction), but the reverse also has to be checked — defining `{b}` as a plain
+  field *after* some existing formula `{t} = {b} + {x}` already uses `{b}` as an operand would
+  retroactively turn a real field into an illegal dependency. The first draft only checked the
+  first direction; the review caught that a formula's own name being already-used-as-an-operand
+  by an existing formula needed its own explicit refusal too.
+
+### The one real limitation, stated as a design property, not a bug
+
+A formula's operands only get their own input row — and are therefore only *recoverable* on a
+later "Edit Label" reopen — when they *also* appear literally elsewhere in the same template. This
+is the exact same shape of reasoning round 8's derived `{explanation}` field was rejected over: the
+condition for "the operands are enterable" and the condition for "the description round-trips
+exactly" are the same condition, which is precisely why nothing needed fixing here rather than
+something needing building. `{total}` in a template that never mentions its own operands still
+computes and renders correctly live; it simply won't reproduce byte-for-byte on a later Edit, and
+the existing "Fill will reword this description" signal already says so — no new UI needed.
+
+### Verification
+
+`node --check` passes on both files; `desc_loader.js` rebuilt clean (124226 bytes) and reconfirmed
+free of any control byte. Spot-checked in the two parts the plan called for, specifically to prove
+the shared-function decision above is load-bearing rather than just tidy: (1) bypassed
+`RW._dbApplyFormulas`'s call inside `RW._dbRenderFinal` — confirmed exactly the five
+formula-dependent tests failed (`26g-2`, `26g-3`, `26m`, `26n-2`, `26y`), every pure test and every
+zero-formula regression staying green; (2) separately, reverted *only* `RW._dbDetectTemplate` back
+to its own inline render+NS call (leaving `RW._dbComputeOutput` on `RW._dbRenderFinal`) — confirmed
+*exactly* `26y` failed, alone, the direct proof that sharing one function is what's actually doing
+the work here.
+
+**`verify_desc.js` — grew from 429 to 520 tests.** New section 26 covers: the pure parser/evaluator
+layer (`RW._dbParseFormulaExpr`/`RW._dbParseFormulaDefinition` accept/reject matrices — spacing
+variants, the 2-operand minimum, every disallowed shape: parens, `*`/`/`, literal numbers, a
+modifier on an operand; `RW._dbEvaluateFormula`'s signed arithmetic and fractional formatting,
+blank the moment any operand is missing/`NS`/a datum name); `RW._dbApplyFormulas`'s identity when
+no formulas exist and its snapshot-based order-independence (a hand-injected illegal chain,
+bypassing validation entirely, evaluates to blank in both array orders — proof the compute path
+never depends on validation being airtight everywhere it's reachable from); `RW._dbNeedsSpan`
+matching `RW._dbTemplateUsesSpan` exactly with no formulas defined, and additionally true for a
+formula that reads `{span}` in a template that never mentions `{span}` itself; the DOM/UI seam —
+Advanced-only visibility, a valid Add updating the derived-name set and clearing the input, every
+one of the refusal messages (malformed shape, malformed right-hand side, name too long, reserved
+name, duplicate, self-reference, chaining in both directions, `{a}` as an operand, a name colliding
+with an existing template field), Delete freeing the name back up as a plain field; preview/Fill
+agreement with a live formula; persistence mirroring round 6's own shapes (storage holds only
+`{name, expr}`; survives a simulated reload; corrupt/reserved/self-referencing/chained entries drop
+individually without throwing — a chained entry alone is dropped, the formula it chains off stays
+valid on its own; console override wins; a throwing `localStorage` crashes nothing; deleting the
+last formula removes the key); and the untouched-guarantee regressions with zero formulas defined
+(the pre-existing headline test byte-for-byte; `RW._dbDerivedNames` deep-equals `{span:true,
+a:true}`; round 8's NS substitution still firing through `RW._dbRenderFinal`; round 4's field
+recovery unaffected by a formula placeholder sitting in the template).
+
+**Not yet live-verified**: the new formula input row's and formula list's legibility and layout
+inside the real, Tailwind-styled modal (proven only against the synthetic stub), and whether the
+panel still fits comfortably under the existing 40vh height cap once both the template-management
+row and a handful of defined formulas are visible at once.
 
 ## Constraints (do not violate)
 

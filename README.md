@@ -40,9 +40,11 @@ bash build_loader.sh
 1. Navigate to a Constructions Tagger annotation page.
 2. Press **F12** → **Console** tab.
 3. Paste the entire contents of `desc_loader.js`, press **Enter**.
-4. Open a label — either **+ New Label** or click an existing pin and choose to edit it. The
-   builder appears as a small panel directly above the **Description** field, inside the app's
-   own dialog.
+4. Open a label — either **+ New Label** or click an existing pin and choose to edit it. If there's
+   room, the builder docks as a small panel beside the dialog's own right edge — out of the way of
+   its own fields entirely. On a narrower window, it falls back to appearing directly above the
+   **Description** field instead, inside the dialog, exactly as before. Either way it appears and
+   disappears together with the dialog.
 
 Paste again after each page navigation — nothing here persists across a reload, including
 whatever you'd typed into the builder's own fields (the app's own **Save**, on the description
@@ -163,15 +165,33 @@ Click **Advanced** in the panel's own header to reveal:
 - **Multiple named templates** — one drawing source's house format is often genuinely different
   from another's, so you're not limited to editing the one template in place. Type a name next to
   the template box and click **Save as new** to save the current text as a brand-new named
-  template (the picker switches to it); **Rename** renames whichever one is currently selected
-  without touching its text; **Delete** removes it (refused if it's the only one left — there must
-  always be something selected). Every one of these actions, and any edit you type directly into
-  the template box, is saved automatically and carries over to your *next* session too — re-paste
+  template (the picker switches to it) — or type the name of a template that already exists, and
+  it offers to **overwrite** it instead: the button relabels to **Overwrite?**, and a second click
+  replaces that template's saved text with what's currently in the box (typing something else, or
+  just waiting, cancels it — nothing is replaced until you click twice on the same name).
+  **Rename** renames whichever one is currently selected without touching its text (this one still
+  refuses a name already in use, rather than merging); **Delete** removes it (refused if it's the
+  only one left — there must always be something selected). Every one of these actions, and any
+  edit you type directly into the template box, is saved automatically and carries over to your
+  *next* session too — re-paste
   the loader after a page reload and every saved template, and which one you last had selected,
   is still there, no retyping. (Everything else in this add-on — Simple/Advanced, Remember Values,
   the collapsed/expanded panel — stays session-only, same as always.) Click **Reset to default**
   to throw away whatever's saved for the *current* template and restore its built-in text — it
   never touches any other saved template.
+- **Formula fields** — a computed field, defined once and usable in *any* saved template, not just
+  the one you were editing when you defined it. Type something like `{total} = {a} + {b}` into the
+  formula box and click **Add formula**: `{total}` then works exactly like `{span}` already does,
+  computing automatically from whatever `{a}` and `{b}` currently hold. Only a plain `+`/`-` chain
+  of two or more `{field}` names is supported — no parentheses, no multiplication, no typing a bare
+  number into the expression itself (add a real field for that instead). A formula's operands must
+  be plain fields (or `{span}`); a formula can't be built from another formula, and it can't use
+  its own name as one of its own operands. Delete removes it and frees the name back up. One thing
+  worth knowing: a formula's operands only get their own input row — and are therefore only
+  recoverable if you reopen that label later — when they *also* appear somewhere else in the same
+  template on their own; if you use `{a}`/`{b}` only inside the formula and nowhere else, the
+  computed value still renders correctly right now, it just won't read back in on a later Edit
+  (the same "Fill will reword this description" status line already tells you when that's true).
 
 ### Remembering values
 

@@ -19,10 +19,27 @@ function ok(cond, name){
 
 /* ---------- minimal DOM stub ---------- */
 
+// A real DOMRect (what getBoundingClientRect() actually returns) auto-computes right/bottom from
+// left/top/width/height — a plain {left,top,width,height} literal does not. Round 10's
+// RW._dbPositionPanel reads .right, so every getBoundingClientRect() stub/override needs it too.
+function rect(left, top, width, height){
+  return { left, top, width, height, right: left + width, bottom: top + height };
+}
+
 function makeStubWindow(){
   const registry = new Map();
   function registerId(el){ if (el && el.id) registry.set(el.id, el); }
   function unregisterId(el){ if (el && el.id && registry.get(el.id) === el) registry.delete(el.id); }
+  // A real DOM node has exactly one parent at a time — appendChild/insertBefore/
+  // insertAdjacentElement on an already-placed node MOVES it, never duplicates it. Removes `node`
+  // from its current parent's _children (if any) without touching the id registry — the node
+  // stays registered throughout, since it's about to be re-attached, not detached for good.
+  function detachFromParent(node){
+    const parent = node && node._parent;
+    if (!parent) return;
+    const i = parent._children.indexOf(node);
+    if (i !== -1) parent._children.splice(i, 1);
+  }
 
   function createElement(tag){
     let _id = '';
@@ -68,8 +85,17 @@ function makeStubWindow(){
       setPointerCapture(){}, releasePointerCapture(){},
       setAttribute(name, val){ attrs[name] = String(val); if (name === 'list') this.list = val; },
       getAttribute(name){ return Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null; },
-      appendChild(child){ this._children.push(child); child._parent = this; registerId(child); return child; },
+      // A real DOM node has exactly one parent at a time — appendChild/insertBefore/
+      // insertAdjacentElement on an ALREADY-PLACED node silently MOVES it, never duplicates it.
+      // detachFromParent is what gives the stub that semantic (round 10 exposed the gap: nothing
+      // previously re-inserted an already-placed element, since RW._dbPositionPanel is the first
+      // code to unconditionally re-parent the same node on every open).
+      appendChild(child){
+        detachFromParent(child);
+        this._children.push(child); child._parent = this; registerId(child); return child;
+      },
       insertBefore(child, ref){
+        detachFromParent(child);
         const idx = this._children.indexOf(ref);
         if (idx === -1) this._children.push(child); else this._children.splice(idx, 0, child);
         child._parent = this; registerId(child); return child;
@@ -92,6 +118,7 @@ function makeStubWindow(){
       insertAdjacentElement(pos, child){
         const parent = this._parent;
         if (!parent){ return child; }
+        detachFromParent(child); // BEFORE computing idx — child may already sit in this same parent
         const idx = parent._children.indexOf(this);
         const at = pos === 'afterend' ? idx + 1 : idx; // 'beforebegin' (this repo's only use)
         parent._children.splice(at, 0, child);
@@ -131,7 +158,10 @@ function makeStubWindow(){
       click(){ this._fire('click', {}); },
       focus(){},
       setSelectionRange(s, e){ this.selectionStart = s; this.selectionEnd = e; },
-      getBoundingClientRect(){ return { left: 0, top: 0, width: 100, height: 100 }; },
+      // width:1200 matches the stub's own innerWidth (below) — right = 1200, leaving NO room to
+      // the right by default (round 10's RW._dbPositionPanel), so every existing test keeps
+      // mounting inline unchanged; round-10 tests override this per-test to simulate room to float.
+      getBoundingClientRect(){ return rect(0, 0, 1200, 100); },
     };
     return el;
   }
@@ -2070,6 +2100,773 @@ async function main(){
     bot._fire('input', {});
     ok(!thickness.readOnly, '23g: an ordinary bot value never read-onlies {thickness}');
     ok(thickness.value === '', '23g-2: {thickness} is never auto-filled from an ordinary bot value');
+  }
+
+  /* ===== 24. Round 10 — float the panel beside the modal when there's room ===== */
+  {
+    // 24a: default (the stub's default modal rect leaves NO room) -> mounts inline, exactly as
+    // every prior round's behavior — the whole feature is a no-op for this, the common, scenario.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    const modal = win.document.getElementById('label-modal');
+    const root = win.document.getElementById('rw-db-root');
+    ok(!!modal.querySelector('#rw-db-root'), '24a: root stays a descendant of the modal by default');
+    ok(root.style.position !== 'fixed', '24a-2: not positioned fixed');
+    ok(/max-height:40vh/.test(root.style.cssText), '24a-3: the original 40vh inline cap is restored');
+  }
+  {
+    // 24b: enough room to the modal's right -> floats. Regression test for the exact bug
+    // boon-label-management hit once: a fixed-position element with no explicit anchor falls back
+    // to its static position and can render fully off-screen — assert BOTH top and left are set.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    modal.getBoundingClientRect = () => rect(0, 50, 200, 400); // right=200, room=1000
+    const RW = loadModule(win);
+    const root = win.document.getElementById('rw-db-root');
+    ok(root._parent === win.document.body, '24b: root is re-parented to document.body');
+    ok(root.style.position === 'fixed', '24b-2: position:fixed');
+    ok(!!root.style.top && !!root.style.left,
+      '24b-3: BOTH top and left are explicitly set — never left to fall back to a static position');
+    ok(root.style.left === '212px', '24b-4: docked just past the modal\'s right edge (200 + 12px gap)');
+    ok(root.style.width === '320px', '24b-5: an explicit width, since it no longer derives one from an inline flow parent');
+    ok(root.style.zIndex === '2147483646', '24b-6: a z-index high enough to sit above the host app');
+  }
+  {
+    // 24c: Fill, the "Reset to default" button, and a genuine reopen's own field-reset all still
+    // work correctly while floating — the regression test for the four
+    // modal.querySelector -> document.getElementById fixes.
+    let win = seedWin(makeStubWindow().win);
+    const MO = makeMutationObserverStub();
+    win.MutationObserver = MO;
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    modal.getBoundingClientRect = () => rect(0, 0, 200, 400);
+    const RW = loadModule(win);
+    ok(win.document.getElementById('rw-db-root')._parent === win.document.body, 'precondition: floating');
+
+    win.document.getElementById('rw-db-field-desc').value = 'Concrete';
+    win.document.getElementById('rw-db-field-desc')._fire('input', {});
+    win.document.getElementById('rw-db-fill')._fire('click', {});
+    const descInp = modal.querySelector('#label-description');
+    ok(descInp.value.indexOf('Concrete') === 0, '24c: Fill still writes into the host\'s Description field while floating');
+
+    const descInp2 = modal.querySelector('#label-description');
+    descInp2.value = 'A hand-written description already here.';
+    win.document.getElementById('rw-db-fill')._fire('click', {});
+    ok(win.document.getElementById('rw-db-fill').innerText === 'Overwrite?',
+      '24c-2: the two-click overwrite guard still relabels the (floating) button correctly');
+
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {}); // reveal the template box
+    const templateEl = win.document.getElementById('rw-db-template');
+    templateEl.value = '{onlyfield}';
+    templateEl._fire('input', {});
+    win.document.getElementById('rw-db-template-reset')._fire('click', {});
+    ok(templateEl.value === RW._dbBuiltinDefaultTemplate,
+      '24c-3: Reset to default still finds the (floating) template box via its own fixed lookup');
+
+    // A genuine reopen exercises RW._dbResetFields' OWN two fixed lookups directly (distinct from
+    // RW._dbResetTemplateToDefault's, tested above) — the Fill button relabel and the template
+    // box reset both still need to find the floating panel's own elements. Both "before" states
+    // are set through a path INDEPENDENT of RW._dbRunFill/the template input listener (which have
+    // their own, separately-tested lookups), so a skipped reset and a genuine one are actually
+    // distinguishable here, rather than accidentally producing the same end state either way.
+    const fillBtnEl = win.document.getElementById('rw-db-fill');
+    fillBtnEl.innerText = 'Overwrite?'; // forced directly, not via a Fill click
+    templateEl.value = 'garbage-not-the-default'; // forced directly, WITHOUT firing input — so
+                                                     // RW._dbDefaultTemplate itself is untouched
+    const expectedDefault = RW._dbDefaultTemplate;
+    modal.hidden = true; MO._instances[0].trigger();
+    modal.hidden = false; MO._instances[0].trigger();
+    ok(win.document.getElementById('rw-db-fill').innerText === 'Fill Description',
+      '24c-4: a fresh reopen resets the (floating) Fill button\'s label via RW._dbResetFields\' own fixed lookup');
+    ok(win.document.getElementById('rw-db-template').value === expectedDefault,
+      '24c-5: ...and resets the (floating) template box back to the default, not left at "garbage-not-the-default"');
+  }
+  {
+    // 24d: RW._dbApplyPanelVisibility — a floating root gets NO visibility inheritance from the
+    // modal at all (unlike inline, where a hidden ancestor already hides it for free), so this
+    // must be synced explicitly. A scenario that couldn't even arise before this round.
+    let win = seedWin(makeStubWindow().win);
+    const MO = makeMutationObserverStub();
+    win.MutationObserver = MO;
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    modal.getBoundingClientRect = () => rect(0, 0, 200, 400);
+    const RW = loadModule(win);
+    const root = win.document.getElementById('rw-db-root');
+    ok(root.style.display !== 'none', 'precondition: visible while the modal is visible');
+
+    modal.hidden = true; MO._instances[0].trigger();
+    ok(root.style.display === 'none', '24d: the floating root hides when the modal hides');
+
+    modal.hidden = false; MO._instances[0].trigger();
+    ok(root.style.display !== 'none', '24d-2: and shows again when the modal shows');
+  }
+  {
+    // 24e: position is computed ONCE per open, not tracked continuously — the user's own choice.
+    let win = seedWin(makeStubWindow().win);
+    const MO = makeMutationObserverStub();
+    win.MutationObserver = MO;
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    modal.getBoundingClientRect = () => rect(0, 0, 200, 400);
+    const RW = loadModule(win);
+    const root = win.document.getElementById('rw-db-root');
+    const firstLeft = root.style.left;
+    ok(firstLeft === '212px', 'precondition: initial position');
+
+    // Change the rect and fire a mutation WITHOUT a hidden->visible edge (still visible throughout)
+    modal.getBoundingClientRect = () => rect(0, 0, 500, 400);
+    MO._instances[0].trigger();
+    ok(root.style.left === firstLeft, '24e: an unrelated mutation while still open does not reposition the panel');
+
+    // A genuine reopen DOES pick up the new rect.
+    modal.hidden = true; MO._instances[0].trigger();
+    modal.hidden = false; MO._instances[0].trigger();
+    ok(root.style.left === '512px', '24e-2: a fresh reopen recomputes position against the modal\'s current rect');
+  }
+  {
+    // 24f: RW._dbBuildPanel's idempotency guard still correctly finds the root once it has
+    // floated outside the modal — the specific bug a modal-scoped check would have reintroduced.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    modal.getBoundingClientRect = () => rect(0, 0, 200, 400);
+    const RW = loadModule(win);
+    RW._dbMaybeInject(modal); // a repeat call, as test 9b already exercises for the inline case
+    const bodyRoots = win.document.body._children.filter((c) => c.id === 'rw-db-root');
+    const modalRoots = modal._children.filter((c) => c.id === 'rw-db-root');
+    ok(bodyRoots.length === 1 && modalRoots.length === 0,
+      '24f: exactly one root exists, in document.body — no duplicate built after floating');
+  }
+
+  /* ===== 25. Round 11 — Save as new can overwrite an existing template, with a two-click confirm ===== */
+  {
+    // 25a: a genuinely new name still saves immediately, no confirm needed — unchanged behavior.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win.document.getElementById('rw-db-tpl-name').value = 'B';
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
+    ok(RW._dbTemplates.length === 2 && RW._dbActiveTemplateName === 'B',
+      '25a: a new name saves and selects immediately, on the first click');
+    ok(win.document.getElementById('rw-db-tpl-saveas').innerText === 'Save as new',
+      '25a-2: the button never relabels for a non-duplicate name');
+  }
+  {
+    // 25b-25e: the two-click overwrite confirm, mirroring RW._dbRunFill's own idiom exactly.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    const nameEl = win.document.getElementById('rw-db-tpl-name');
+    const saveBtn = win.document.getElementById('rw-db-tpl-saveas');
+    const statusEl = win.document.getElementById('rw-db-tpl-status');
+    const templateEl = win.document.getElementById('rw-db-template');
+
+    nameEl.value = 'B';
+    saveBtn._fire('click', {}); // create the target we'll later try to overwrite
+    templateEl.value = '{onlyb}';
+    templateEl._fire('input', {});
+    win.document.getElementById('rw-db-template-select').value = 'Default';
+    win.document.getElementById('rw-db-template-select')._fire('change', {});
+    templateEl.value = '{newtext}'; // what we're about to save OVER "B"
+    templateEl._fire('input', {});
+
+    nameEl.value = 'B'; // an EXISTING name
+    saveBtn._fire('click', {});
+    ok(RW._dbTemplates.find((t) => t.name === 'B').text === '{onlyb}',
+      '25b: the first click does NOT overwrite yet');
+    ok(saveBtn.innerText === 'Overwrite?', '25c: the button relabels to "Overwrite?"');
+    ok(statusEl.innerText.indexOf('"B" already exists') !== -1, '25c-2: inline status explains why');
+    ok(RW._dbActiveTemplateName === 'Default', '25c-3: the active template has not changed yet either');
+
+    saveBtn._fire('click', {}); // same name, second click
+    ok(RW._dbTemplates.find((t) => t.name === 'B').text === '{newtext}',
+      '25d: a second click on the SAME target commits the overwrite');
+    ok(RW._dbActiveTemplateName === 'B', '25d-2: the overwritten template becomes active');
+    ok(saveBtn.innerText === 'Save as new', '25e: the button relabels back afterward');
+    ok(statusEl.innerText === '' && nameEl.value === '', '25e-2: status and the name field both clear');
+    ok(RW._dbTemplates.length === 2, '25e-3: no new entry was created — "B" was overwritten, not duplicated');
+  }
+  {
+    // 25f: changing the typed name between clicks does NOT confirm the original target — it's
+    // treated as a fresh first click for the NEW target instead.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    const nameEl = win.document.getElementById('rw-db-tpl-name');
+    const saveBtn = win.document.getElementById('rw-db-tpl-saveas');
+    nameEl.value = 'B'; saveBtn._fire('click', {});
+    nameEl.value = 'C'; saveBtn._fire('click', {});
+
+    nameEl.value = 'Default'; // arm targeting "Default"
+    saveBtn._fire('click', {});
+    ok(saveBtn.innerText === 'Overwrite?', 'precondition: armed for "Default"');
+
+    nameEl.value = 'B'; // switch target WITHOUT a plain input event — direct click with new value
+    saveBtn._fire('click', {});
+    ok(RW._dbTemplates.find((t) => t.name === 'Default').text === RW._dbBuiltinDefaultTemplate,
+      '25f: "Default" was NOT overwritten — the target changed before a matching second click');
+    ok(saveBtn.innerText === 'Overwrite?', '25f-2: instead, it re-armed for the new target ("B")');
+  }
+  {
+    // 25g: typing into the name field (an input event) cancels an armed confirmation outright.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    const nameEl = win.document.getElementById('rw-db-tpl-name');
+    const saveBtn = win.document.getElementById('rw-db-tpl-saveas');
+    const statusEl = win.document.getElementById('rw-db-tpl-status');
+    nameEl.value = 'Default';
+    saveBtn._fire('click', {});
+    ok(saveBtn.innerText === 'Overwrite?', 'precondition: armed');
+
+    nameEl.value = 'Default2';
+    nameEl._fire('input', {});
+    ok(saveBtn.innerText === 'Save as new', '25g: typing after arming cancels it — button relabels back');
+    ok(statusEl.innerText === '', '25g-2: the status note clears too');
+  }
+  {
+    // 25h: switching the active template (via the picker) cancels a pending overwrite arm.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win.document.getElementById('rw-db-tpl-name').value = 'B';
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
+    win.document.getElementById('rw-db-tpl-name').value = 'Default'; // now arm on "Default"
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
+    ok(win.document.getElementById('rw-db-tpl-saveas').innerText === 'Overwrite?', 'precondition: armed');
+
+    win.document.getElementById('rw-db-template-select').value = 'B';
+    win.document.getElementById('rw-db-template-select')._fire('change', {});
+    ok(win.document.getElementById('rw-db-tpl-saveas').innerText === 'Save as new',
+      '25h: switching templates cancels the pending arm');
+  }
+  {
+    // 25i: a fresh modal reopen also cancels a pending arm — never carried over between labels.
+    let win = seedWin(makeStubWindow().win);
+    const MO = makeMutationObserverStub();
+    win.MutationObserver = MO;
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win.document.getElementById('rw-db-tpl-name').value = 'Default';
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
+    ok(win.document.getElementById('rw-db-tpl-saveas').innerText === 'Overwrite?', 'precondition: armed');
+
+    modal.hidden = true; MO._instances[0].trigger();
+    modal.hidden = false; MO._instances[0].trigger();
+    ok(win.document.getElementById('rw-db-tpl-saveas').innerText === 'Save as new',
+      '25i: a fresh reopen cancels any pending overwrite arm');
+  }
+  {
+    // 25j: the duplicate check is case-insensitive, matching the existing Save-as-new/Rename rule.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win.document.getElementById('rw-db-tpl-name').value = 'DEFAULT'; // differs only in case from "Default"
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
+    ok(win.document.getElementById('rw-db-tpl-saveas').innerText === 'Overwrite?',
+      '25j: an existing name is recognized case-insensitively, same as Save-as-new/Rename already were');
+    ok(RW._dbTemplates.length === 1, '25j-2: no duplicate entry was created for the differently-cased name');
+  }
+  {
+    // 25k: overwriting the ACTIVE template's own name is a harmless, working no-op-ish case.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    const templateEl = win.document.getElementById('rw-db-template');
+    templateEl.value = '{editedwhileactive}';
+    templateEl._fire('input', {});
+    win.document.getElementById('rw-db-tpl-name').value = 'Default'; // its OWN current name
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
+    ok(RW._dbTemplates.length === 1 && RW._dbTemplates[0].name === 'Default'
+      && RW._dbTemplates[0].text === '{editedwhileactive}',
+      '25k: overwriting the active template with its own name works without error or duplication');
+  }
+  {
+    // 25l: regression guard — Rename is unaffected by any of this; it still refuses a duplicate
+    // outright, with no arm/confirm state, and never overwrites the OTHER entry.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win.document.getElementById('rw-db-tpl-name').value = 'B';
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {}); // now active = "B"
+    win.document.getElementById('rw-db-tpl-name').value = 'Default';
+    win.document.getElementById('rw-db-tpl-rename')._fire('click', {});
+    ok(RW._dbActiveTemplateName === 'B', '25l: Rename still refuses a duplicate outright — no overwrite, no rename');
+    ok(RW._dbTemplates.find((t) => t.name === 'Default').text === RW._dbBuiltinDefaultTemplate,
+      '25l-2: the OTHER entry ("Default") is completely untouched');
+    ok(win.document.getElementById('rw-db-tpl-rename').innerText === 'Rename',
+      '25l-3: Rename has no two-click confirm state of its own — it never relabels');
+  }
+
+  /* ===== 26. Round 12 — user-definable formula fields ===== */
+  {
+    // 26a: RW._dbParseFormulaExpr — accepted shapes
+    const win = seedWin(makeStubWindow().win);
+    const RW = loadModule(win);
+    ok(JSON.stringify(RW._dbParseFormulaExpr('{a} + {b}')) === JSON.stringify({ names: ['a', 'b'], ops: ['+'] }),
+      '26a: spaced two-operand chain');
+    ok(JSON.stringify(RW._dbParseFormulaExpr('{a}+{b}-{c}')) === JSON.stringify({ names: ['a', 'b', 'c'], ops: ['+', '-'] }),
+      '26a-2: no whitespace at all, three operands');
+    ok(JSON.stringify(RW._dbParseFormulaExpr('  {a}   +   {b}  ')) === JSON.stringify({ names: ['a', 'b'], ops: ['+'] }),
+      '26a-3: extra/irregular whitespace tolerated');
+    ok(JSON.stringify(RW._dbParseFormulaExpr('{a} - {b} + {c} - {d}')) === JSON.stringify({ names: ['a', 'b', 'c', 'd'], ops: ['-', '+', '-'] }),
+      '26a-4: a longer mixed chain');
+  }
+  {
+    // 26b: RW._dbParseFormulaExpr — every rejected shape
+    const win = seedWin(makeStubWindow().win);
+    const RW = loadModule(win);
+    ok(RW._dbParseFormulaExpr('') === null, '26b: empty');
+    ok(RW._dbParseFormulaExpr(null) === null, '26b-2: null never throws');
+    ok(RW._dbParseFormulaExpr('{a}') === null, '26b-3: a single operand (a pure, always-blank alias) is refused');
+    ok(RW._dbParseFormulaExpr('{a} +') === null, '26b-4: a dangling trailing operator');
+    ok(RW._dbParseFormulaExpr('+ {a}') === null, '26b-5: a leading operator');
+    ok(RW._dbParseFormulaExpr('{a} * {b}') === null, '26b-6: * is out of scope');
+    ok(RW._dbParseFormulaExpr('{a} / {b}') === null, '26b-7: / is out of scope');
+    ok(RW._dbParseFormulaExpr('({a} + {b})') === null, '26b-8: parentheses are out of scope');
+    ok(RW._dbParseFormulaExpr('{a} + b') === null, '26b-9: a bare (non-braced) name is not a valid operand');
+    ok(RW._dbParseFormulaExpr('{a:lower} + {b}') === null, '26b-10: a modifier on an operand is refused');
+    ok(RW._dbParseFormulaExpr('{a} {b}') === null, '26b-11: two operands with no operator between them');
+    ok(RW._dbParseFormulaExpr('{1a} + {b}') === null, '26b-12: an operand name starting with a digit');
+    ok(RW._dbParseFormulaExpr('{a} + 6"') === null, '26b-13: a literal number is out of scope');
+  }
+  {
+    // 26c: RW._dbParseFormulaDefinition
+    const win = seedWin(makeStubWindow().win);
+    const RW = loadModule(win);
+    ok(JSON.stringify(RW._dbParseFormulaDefinition('{total} = {a} + {b}')) ===
+      JSON.stringify({ name: 'total', expr: '{a} + {b}', names: ['a', 'b'], ops: ['+'] }),
+      '26c: the canonical form');
+    ok(JSON.stringify(RW._dbParseFormulaDefinition('{total}={a}+{b}').names) === JSON.stringify(['a', 'b']),
+      '26c-2: no whitespace around "="');
+    ok(RW._dbParseFormulaDefinition('total = {a} + {b}') === null, '26c-3: a bare (non-braced) LHS is refused');
+    ok(RW._dbParseFormulaDefinition('{total:lower} = {a} + {b}') === null, '26c-4: a modifier on the LHS is refused');
+    ok(RW._dbParseFormulaDefinition('{total} {a} + {b}') === null, '26c-5: missing "="');
+    ok(RW._dbParseFormulaDefinition('{total} = ') === null, '26c-6: empty right-hand side');
+    ok(RW._dbParseFormulaDefinition('{total} = {a} = {b}') === null, '26c-7: a second "=" is not a valid expression');
+  }
+  {
+    // 26d: RW._dbEvaluateFormula
+    const win = seedWin(makeStubWindow().win);
+    const RW = loadModule(win);
+    const add = RW._dbParseFormulaDefinition('{total} = {a} + {b}');
+    ok(RW._dbEvaluateFormula(add, { a: "1'-0\"", b: "2'-0\"" }) === "3'-0\"", '26d: addition');
+    const sub = RW._dbParseFormulaDefinition('{net} = {a} - {b}');
+    ok(RW._dbEvaluateFormula(sub, { a: "1'-0\"", b: "3'-0\"" }) === "-2'-0\"", '26d-2: a negative result formats with a leading "-"');
+    ok(RW._dbEvaluateFormula(sub, { a: "1'-6 1/2\"", b: "0'-6\"" }) === "1'-0 1/2\"", '26d-3: a fractional remainder reduces to sixteenths');
+    const chain = RW._dbParseFormulaDefinition('{t} = {x} - {y} + {z}');
+    ok(RW._dbEvaluateFormula(chain, { x: "1'-0\"", y: "0'-6\"", z: "0'-6\"" }) === "1'-0\"",
+      '26d-4: strict left-to-right, three operands');
+    ok(RW._dbEvaluateFormula(add, { a: "1'-0\"" }) === '', '26d-5: a missing operand -> blank');
+    ok(RW._dbEvaluateFormula(add, { a: "1'-0\"", b: '' }) === '', '26d-6: a blank operand -> blank');
+    ok(RW._dbEvaluateFormula(add, { a: "1'-0\"", b: 'T/WALL' }) === '', '26d-7: a datum-name operand -> blank');
+    ok(RW._dbEvaluateFormula(add, { a: "1'-0\"", b: 'NS' }) === '', '26d-8: an NS operand -> blank');
+    ok(RW._dbEvaluateFormula(add, { a: '18', b: "1'-0\"" }) === '', '26d-9: a bare ambiguous number -> blank (RW._dbParseFtIn rejects it)');
+  }
+  {
+    // 26e: RW._dbApplyFormulas — identity-when-empty and order-independent evaluation
+    const win = seedWin(makeStubWindow().win);
+    const RW = loadModule(win);
+    const values = { a: "1'-0\"", b: "2'-0\"" };
+    ok(RW._dbApplyFormulas(values) === values, '26e: with no formulas defined, the SAME object is returned (a provable no-op)');
+
+    RW._dbFormulas = [RW._dbParseFormulaDefinition('{total} = {a} + {b}')];
+    const out = RW._dbApplyFormulas(values);
+    ok(out !== values && out.total === "3'-0\"", '26e-2: a copy is returned, with the formula value injected');
+    ok(values.total === undefined, '26e-3: the original object is left untouched');
+
+    // Hand-inject an illegal chained pair, bypassing validation entirely, in BOTH array orders —
+    // RW._dbApplyFormulas must degrade to blank regardless, since it evaluates every formula
+    // against a frozen snapshot of the ORIGINAL values, never against its own partial output.
+    const t = RW._dbParseFormulaDefinition('{t} = {a} + {b}');
+    const c = RW._dbParseFormulaDefinition('{c} = {t} + {b}'); // "t" doesn't exist in raw `values`
+    RW._dbFormulas = [t, c];
+    let r = RW._dbApplyFormulas(values);
+    ok(r.t === "3'-0\"" && r.c === '', '26e-4: chained pair, order [t, c] — c degrades to blank, not garbage');
+    RW._dbFormulas = [c, t];
+    r = RW._dbApplyFormulas(values);
+    ok(r.t === "3'-0\"" && r.c === '', '26e-5: same pair, REVERSED array order — identical result, proving order-independence');
+  }
+  {
+    // 26f: RW._dbNeedsSpan
+    const win = seedWin(makeStubWindow().win);
+    const RW = loadModule(win);
+    ok(RW._dbNeedsSpan(RW._dbDefaultTemplate) === RW._dbTemplateUsesSpan(RW._dbDefaultTemplate),
+      '26f: with no formulas, identical to RW._dbTemplateUsesSpan (true case)');
+    ok(RW._dbNeedsSpan('{desc} - {keyword}') === RW._dbTemplateUsesSpan('{desc} - {keyword}'),
+      '26f-2: ...and identical in the false case too');
+    RW._dbFormulas = [RW._dbParseFormulaDefinition('{total} = {span} + {extra}')];
+    ok(RW._dbNeedsSpan('{desc} - {total}') === true,
+      '26f-3: true when a live formula reads {span}, even though the template itself never mentions it');
+  }
+  {
+    // 26g: RW._dbRenderFinal
+    const win = seedWin(makeStubWindow().win);
+    const RW = loadModule(win);
+    const values = { desc: 'Concrete', keyword: 'Wall' };
+    const manual = RW._dbApplyNsExplanation(RW._dbRender('{desc} - {keyword}', values), '{desc} - {keyword}', values);
+    ok(RW._dbRenderFinal('{desc} - {keyword}', values) === manual,
+      '26g: with no formulas, byte-identical to composing RW._dbRender + RW._dbApplyNsExplanation by hand');
+
+    RW._dbFormulas = [RW._dbParseFormulaDefinition('{total} = {x} + {y}')];
+    ok(RW._dbRenderFinal('{total}', { x: "1'-0\"", y: "2'-0\"" }) === "3'-0\"",
+      '26g-2: substitutes the computed formula value');
+    ok(RW._dbRenderFinal('{total:brk}', { x: "-5'-0\"", y: "1'-0\"" }) === "[-4'-0\"]",
+      '26g-3: :brk brackets a negative formula result the same way it brackets top/bot');
+  }
+  {
+    // 26h: Advanced-only visibility
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    ok(win.document.getElementById('rw-db-formula-wrap').style.display === 'none',
+      '26h: hidden in Simple mode');
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    ok(win.document.getElementById('rw-db-formula-wrap').style.display === '',
+      '26h-2: shown in Advanced mode');
+  }
+  {
+    // 26i: a valid Add — collection grows, derived names update, inputs clear, no field row.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    const inputEl = win.document.getElementById('rw-db-formula-input');
+    inputEl.value = '{total} = {top} + {thickness}';
+    win.document.getElementById('rw-db-formula-add')._fire('click', {});
+    ok(RW._dbFormulas.length === 1 && RW._dbFormulas[0].name === 'total', '26i: the formula is added');
+    ok(RW._dbDerivedNames.total === true, '26i-2: its name is registered as derived');
+    ok(inputEl.value === '' && win.document.getElementById('rw-db-formula-status').innerText === '',
+      '26i-3: the input and status both clear');
+    ok(!win.document.getElementById('rw-db-field-total'), '26i-4: no plain input field is created for it');
+    ok(!!win.document.getElementById('rw-db-formula-row-total'), '26i-5: a row appears in the formula list');
+  }
+  {
+    // 26j: every refusal, with its exact message, leaves the collection unchanged.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    const inputEl = win.document.getElementById('rw-db-formula-input');
+    const statusEl = win.document.getElementById('rw-db-formula-status');
+    const add = (raw) => { inputEl.value = raw; win.document.getElementById('rw-db-formula-add')._fire('click', {}); };
+
+    add('garbage');
+    ok(RW._dbFormulas.length === 0 && statusEl.innerText.indexOf('{total} = {a} + {b}') !== -1,
+      '26j: malformed shape — got: ' + statusEl.innerText);
+
+    add('{total} = {x}');
+    ok(RW._dbFormulas.length === 0 && statusEl.innerText.indexOf('two or more') !== -1,
+      '26j-2: malformed right-hand side — got: ' + statusEl.innerText);
+
+    add('{' + 'q'.repeat(41) + '} = {x} + {y}');
+    ok(RW._dbFormulas.length === 0 && statusEl.innerText.indexOf('too long') !== -1, '26j-3: name too long');
+
+    add('{span} = {x} + {y}');
+    ok(RW._dbFormulas.length === 0 && statusEl.innerText.indexOf('reserved') !== -1, '26j-4: reserved name (span)');
+
+    add('{a} = {x} + {y}');
+    ok(RW._dbFormulas.length === 0 && statusEl.innerText.indexOf('reserved') !== -1, '26j-5: reserved name (a)');
+
+    add('{total} = {x} + {y}');
+    ok(RW._dbFormulas.length === 1, 'precondition: "total" defined');
+    add('{total} = {p} + {q}');
+    ok(RW._dbFormulas.length === 1 && RW._dbFormulas[0].expr === '{x} + {y}' && statusEl.innerText.indexOf('already exists') !== -1,
+      '26j-6: duplicate name — refused, original untouched — got: ' + statusEl.innerText);
+
+    add('{t} = {t} + {z}');
+    ok(!RW._dbFormulas.some((f) => f.name === 't') && statusEl.innerText.indexOf("can't use its own name") !== -1,
+      '26j-7: self-reference — got: ' + statusEl.innerText);
+
+    add('{c} = {total} + {z}');
+    ok(!RW._dbFormulas.some((f) => f.name === 'c') && statusEl.innerText.indexOf('is itself a formula') !== -1,
+      '26j-8: an operand that is already a formula — got: ' + statusEl.innerText);
+
+    add('{x} = {p} + {q}'); // "x" is already an OPERAND of "total" — the other chaining direction
+    ok(!RW._dbFormulas.some((f) => f.name === 'x') && statusEl.innerText.indexOf('already used inside the formula for "total"') !== -1,
+      '26j-9: a name already used as an OPERAND of an existing formula — got: ' + statusEl.innerText);
+
+    add('{net} = {x} + {a}');
+    ok(!RW._dbFormulas.some((f) => f.name === 'net') && statusEl.innerText.indexOf("a/an article") !== -1,
+      '26j-10: {a} the article as an operand — got: ' + statusEl.innerText);
+
+    add('{desc} = {p} + {q}'); // "desc" is a real field in the built-in default template
+    ok(!RW._dbFormulas.some((f) => f.name === 'desc') && statusEl.innerText.indexOf('already a field in the template') !== -1,
+      '26j-11: name collides with a plain field in a saved template — got: ' + statusEl.innerText);
+  }
+  {
+    // 26k/26l: Delete — via RW._dbDeleteFormula directly and via its own row button.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win.document.getElementById('rw-db-formula-input').value = '{total} = {x} + {y}';
+    win.document.getElementById('rw-db-formula-add')._fire('click', {});
+    ok(!!win.document.getElementById('rw-db-formula-del-total'), 'precondition: the row and its Delete button exist');
+
+    win.document.getElementById('rw-db-formula-del-total')._fire('click', {});
+    ok(RW._dbFormulas.length === 0, '26k: the formula is removed');
+    ok(RW._dbDerivedNames.total === undefined, '26k-2: its derived-name registration is removed too');
+    ok(!win.document.getElementById('rw-db-formula-row-total'), '26l: its row disappears from the list');
+
+    // "total" is usable as a plain field again, now that it's no longer a formula.
+    const templateEl = win.document.getElementById('rw-db-template');
+    templateEl.value = '{total}';
+    templateEl._fire('input', {});
+    ok(!!win.document.getElementById('rw-db-field-total'), '26k-3: {total} becomes a normal input field on the next rebuild');
+  }
+  {
+    // 26m: preview and Fill agree exactly, with a formula in play.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win.document.getElementById('rw-db-formula-input').value = '{total} = {x} + {y}';
+    win.document.getElementById('rw-db-formula-add')._fire('click', {});
+    const templateEl = win.document.getElementById('rw-db-template');
+    // {x}/{y} must ALSO appear literally in the template — a formula's operands only get their
+    // own input row when they're literally used somewhere (see round 12's documented round-trip
+    // limitation) — {total} alone would leave nothing for the annotator to actually type into.
+    templateEl.value = 'x: {x}\ny: {y}\ntotal: {total}';
+    templateEl._fire('input', {});
+    const set = (name, val) => { const el = win.document.getElementById('rw-db-field-' + name); el.value = val; el._fire('input', {}); };
+    set('x', "1'-0\""); set('y', "2'-0\"");
+
+    const preview = win.document.getElementById('rw-db-preview').innerText;
+    ok(preview === "x: 1'-0\"\ny: 2'-0\"\ntotal: 3'-0\"", '26m: the preview shows the computed total — got: ' + preview);
+    ok(preview === RW._dbComputeOutput(), '26m-2: matches RW._dbComputeOutput exactly');
+
+    win.document.getElementById('rw-db-fill')._fire('click', {});
+    ok(modal.querySelector('#label-description').value === preview, '26m-3: Fill writes exactly what the preview showed');
+  }
+  {
+    // 26n: a formula reading {span} in a template that never mentions {span} itself still
+    // computes, and the span row (and its Override button) becomes visible.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win.document.getElementById('rw-db-formula-input').value = '{doubled} = {span} + {span}';
+    win.document.getElementById('rw-db-formula-add')._fire('click', {});
+    const templateEl = win.document.getElementById('rw-db-template');
+    // {top}/{bot} still need their own literal mention to get real input rows — the span ROW
+    // itself is a fixed part of the panel, not template-generated, which is exactly what this
+    // test is proving (it shows even though {span} itself is never written by the template).
+    templateEl.value = 'top: {top}\nbot: {bot}\ndoubled: {doubled}';
+    templateEl._fire('input', {});
+    ok(!!win.document.getElementById('rw-db-span-row') && win.document.getElementById('rw-db-span-row').style.display !== 'none',
+      '26n: the span row is visible even though the template never writes {span} itself');
+    const set = (name, val) => { const el = win.document.getElementById('rw-db-field-' + name); el.value = val; el._fire('input', {}); };
+    set('top', "-12'-0\""); set('bot', "-14'-0\"");
+    ok(win.document.getElementById('rw-db-preview').innerText === "top: -12'-0\"\nbot: -14'-0\"\ndoubled: 4'-0\"",
+      '26n-2: computed correctly — got: ' + win.document.getElementById('rw-db-preview').innerText);
+  }
+  {
+    // 26o: persistence — only {name, expr} is written.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win.document.getElementById('rw-db-formula-input').value = '{total} = {x} + {y}';
+    win.document.getElementById('rw-db-formula-add')._fire('click', {});
+    const saved = JSON.parse(win.localStorage.getItem(RW._dbFormulasStorageKey));
+    ok(JSON.stringify(saved) === JSON.stringify([{ name: 'total', expr: '{x} + {y}' }]),
+      '26o: storage holds only {name, expr} — got: ' + JSON.stringify(saved));
+  }
+  {
+    // 26p: survives a simulated reload (a second window sharing the same underlying storage).
+    const win1 = seedWin(makeStubWindow().win);
+    win1.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win1, { title: 'Create New Label' });
+    const RW1 = loadModule(win1);
+    win1.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win1.document.getElementById('rw-db-formula-input').value = '{total} = {x} + {y}';
+    win1.document.getElementById('rw-db-formula-add')._fire('click', {});
+
+    const win2 = seedWin(makeStubWindow().win);
+    win2.localStorage = win1.localStorage;
+    win2.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win2, { title: 'Create New Label' });
+    const RW2 = loadModule(win2);
+    ok(RW2._dbFormulas.length === 1 && RW2._dbFormulas[0].name === 'total', '26p: survives a reload');
+    ok(RW2._dbDerivedNames.total === true, '26p-2: its derived-name registration survives too');
+  }
+  {
+    // 26q: malformed/illegal stored entries are dropped individually, never throwing, never
+    // rejecting the whole collection.
+    let win = seedWin(makeStubWindow().win);
+    win.localStorage.setItem('rwDescFormulas', JSON.stringify([
+      { name: 'good', expr: '{x} + {y}' },
+      { name: 'badshape', expr: '{x}' },               // single operand
+      { name: 'span', expr: '{x} + {y}' },             // reserved name
+      { name: 'selfref', expr: '{selfref} + {x}' },    // self-reference
+      { name: 'chain1', expr: '{x} + {y}' },
+      { name: 'chain2', expr: '{chain1} + {p}' },      // chains off chain1 — only chain2 is dropped;
+                                                        // chain1 itself is a perfectly valid formula
+                                                        // built from plain fields, so it stands alone
+      'not an object',
+      { name: 'GOOD', expr: '{p} + {q}' },             // case-insensitive duplicate of "good"
+    ]));
+    win.MutationObserver = makeMutationObserverStub();
+    let threw = false, RW;
+    try { makeFakeLabelModal(win, { title: 'Create New Label' }); RW = loadModule(win); }
+    catch (e) { threw = true; }
+    ok(!threw, '26q: a corrupt/illegal formulas blob never crashes install');
+    const names = RW._dbFormulas.map((f) => f.name).sort();
+    ok(JSON.stringify(names) === JSON.stringify(['chain1', 'good']),
+      '26q-2: the genuinely valid entries survive, chain2 alone dropped for chaining — got: ' + JSON.stringify(names));
+  }
+  {
+    // 26r: a non-array / unparseable JSON blob falls back to an empty collection, no throw.
+    let win = seedWin(makeStubWindow().win);
+    win.localStorage.setItem('rwDescFormulas', 'not valid json{');
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    ok(RW._dbFormulas.length === 0, '26r: corrupt JSON falls back to no formulas at all');
+  }
+  {
+    // 26s: a console override (RW._dbFormulas set before this module ran) wins over storage.
+    let win = seedWin(makeStubWindow().win);
+    win.localStorage.setItem('rwDescFormulas', JSON.stringify([{ name: 'fromstorage', expr: '{x} + {y}' }]));
+    win.__RW = { _dbFormulas: [{ name: 'fromconsole', expr: '{x} + {y}' }] };
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    ok(RW._dbFormulas.length === 1 && RW._dbFormulas[0].name === 'fromconsole',
+      '26s: a pre-set console override wins over a seeded stored collection');
+  }
+  {
+    // 26t: a throwing localStorage never crashes install, or a later Add.
+    const s = makeStubWindow();
+    let win = seedWin(s.win);
+    win.localStorage = s.makeStorage({ throwing: true });
+    win.MutationObserver = makeMutationObserverStub();
+    let threw = false, RW;
+    try { makeFakeLabelModal(win, { title: 'Create New Label' }); RW = loadModule(win); }
+    catch (e) { threw = true; }
+    ok(!threw, '26t: a throwing localStorage does not crash install');
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win.document.getElementById('rw-db-formula-input').value = '{total} = {x} + {y}';
+    let threwOnAdd = false;
+    try { win.document.getElementById('rw-db-formula-add')._fire('click', {}); }
+    catch (e) { threwOnAdd = true; }
+    ok(!threwOnAdd, '26t-2: adding a formula with a throwing localStorage does not throw either');
+    ok(RW._dbFormulas.length === 1, '26t-3: the add still succeeds in-memory, just isn\'t persisted');
+  }
+  {
+    // 26u: deleting the last formula removes the storage key entirely.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win.document.getElementById('rw-db-formula-input').value = '{total} = {x} + {y}';
+    win.document.getElementById('rw-db-formula-add')._fire('click', {});
+    ok(win.localStorage.getItem(RW._dbFormulasStorageKey) !== null, 'precondition: saved');
+    win.document.getElementById('rw-db-formula-del-total')._fire('click', {});
+    ok(win.localStorage.getItem(RW._dbFormulasStorageKey) === null, '26u: the key is removed, not left holding "[]"');
+  }
+  {
+    // 26v: untouched-guarantee regressions — with ZERO formulas defined, nothing about this round
+    // changes any existing behavior.
+    const win = seedWin(makeStubWindow().win);
+    const RW = loadModule(win);
+    const values = {
+      desc: 'Concrete', keyword: 'Wall', source: 'schedule', word: 'height',
+      top: "-12'-0\"", bot: "-14'-0\"", thickness: '18"', where: 'the plan and notes',
+    };
+    values.span = RW._dbSpan(values.top, values.bot, '').value;
+    const out = RW._dbRender(RW._dbDefaultTemplate, values);
+    const expected = [
+      'Concrete - Wall', 'schedule', 'height: [-12\'-0"] - [-14\'-0"]', 'thickness: 18"',
+      'explanation: The detail shows an 18" concrete wall with the height of 2\'-0". the thickness can be found in schedule table within the same page while the height can be found in the plan and notes',
+    ].join('\n');
+    ok(out === expected, '26v: the headline test (7a) is unaffected, re-asserted here for locality');
+    ok(JSON.stringify(RW._dbDerivedNames) === JSON.stringify({ span: true, a: true }),
+      '26v-2: RW._dbDerivedNames deep-equals {span:true, a:true} with no formulas ever defined');
+  }
+  {
+    // 26w: round 8's NS substitution still fires correctly through RW._dbRenderFinal.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    const set = (name, val) => { const el = win.document.getElementById('rw-db-field-' + name); el.value = val; el._fire('input', {}); };
+    set('desc', 'Concrete'); set('keyword', 'Wall'); set('source', 'schedule');
+    set('word', 'height'); set('top', "-12'-0\""); set('where', 'the plan and notes');
+    set('thickness', 'NS');
+    ok(win.document.getElementById('rw-db-preview').innerText.indexOf('No thickness information found') !== -1,
+      '26w: round 8\'s NS wording still fires, routed through RW._dbRenderFinal');
+  }
+  {
+    // 26x: round 4's full field recovery is unaffected by a formula placeholder sitting in the
+    // template — it recovers every plain field exactly, and the formula name appears in NONE of
+    // recovered/missing/weak (it was never a candidate to recover in the first place).
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    const helperWin = seedWin(makeStubWindow().win);
+    const RWHelper = loadModule(helperWin);
+    win.__RW = { _dbFormulas: [{ name: 'total', expr: '{x} + {y}' }] }; // won't matter for THIS test
+    const sample = {
+      desc: 'Concrete', keyword: 'Wall', source: 'schedule', word: 'height',
+      top: "-12'-0\"", bot: "-14'-0\"", thickness: '18"', where: 'the plan and notes',
+    };
+    sample.span = RWHelper._dbSpan(sample.top, sample.bot, '').value;
+    const rendered = RWHelper._dbRender(RWHelper._dbDefaultTemplate, sample);
+    makeFakeLabelModal(win, { title: 'Edit Label', description: rendered });
+    const RW = loadModule(win);
+    ok(win.document.getElementById('rw-db-field-desc').value === 'Concrete', '26x: an ordinary field still recovers exactly');
+    ok(win.document.getElementById('rw-db-prefill-status').innerText.indexOf('preview matches it exactly') !== -1,
+      '26x-2: the exact byte-for-byte prefill signal is unaffected');
+  }
+  {
+    // 26y: THE regression test this round exists to prove — with a formula in the active
+    // template, RW._dbDetectTemplate on a description containing its rendered value reports
+    // exact === true. This is the direct check that RW._dbDetectTemplate and RW._dbComputeOutput
+    // sharing RW._dbRenderFinal actually closes the round-9-style gap, not just tidies the code.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win.document.getElementById('rw-db-formula-input').value = '{total} = {x} + {y}';
+    win.document.getElementById('rw-db-formula-add')._fire('click', {});
+    const templateEl = win.document.getElementById('rw-db-template');
+    templateEl.value = 'material: {x}\nother: {y}\ntotal: {total}';
+    templateEl._fire('input', {});
+
+    const desc = 'material: 1\'-0"\nother: 2\'-0"\ntotal: 3\'-0"';
+    const hit = RW._dbDetectTemplate(desc);
+    ok(hit && hit.name === 'Default' && hit.exact === true,
+      '26y: RW._dbDetectTemplate reports an exact match for a description containing the formula\'s own computed value — got ' + JSON.stringify(hit && { name: hit.name, exact: hit.exact }));
   }
 
   console.log((pass + fail) + ' tests, ' + pass + ' passed, ' + fail + ' failed');

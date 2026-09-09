@@ -181,8 +181,15 @@
 
   // Names the template engine computes itself and which must never become an auto-generated
   // field: `span` (RW._dbSpan's result, wired in by the UI layer) and `a` (the a/an article,
-  // resolved from whatever word ends up right after it).
-  const DERIVED_NAMES = { span: true, a: true };
+  // resolved from whatever word ends up right after it). Kept separate from DERIVED_NAMES below
+  // (round 12): this is the genuinely-reserved set — a user-defined formula field is ALSO excluded
+  // from becoming a plain input field, but for a different reason, and telling an annotator their
+  // formula name "is reserved" would be misleading (true only by an implementation accident).
+  const BUILTIN_DERIVED_NAMES = { span: true, a: true };
+  // The actual render/parse exclusion set RW._dbParseTemplate reads — built from
+  // BUILTIN_DERIVED_NAMES plus every current formula name, kept in sync by the one idempotent
+  // dbSyncFormulaDerivedNames() below rather than scattered add/delete mutations that could drift.
+  const DERIVED_NAMES = Object.assign({}, BUILTIN_DERIVED_NAMES);
   RW._dbDerivedNames = DERIVED_NAMES;
 
   const VAR_RE = /\{([A-Za-z][A-Za-z0-9_]*)(?::([A-Za-z]+))?\}/g;
@@ -323,6 +330,92 @@
     return /\{span(?::[A-Za-z]+)?\}/.test(String(text == null ? '' : text));
   };
 
+  /* ---------- round 12: user-definable formula fields ----------
+     A general way to define a NEW computed field via a simple expression — e.g. typing
+     "{total} = {a} + {b}" in Advanced mode makes {total} render a computed value like {span}
+     already does, usable in ANY saved template (global, not tied to one — the same as {span}/{a}
+     aren't). Deliberately narrow scope, confirmed with the user: a strict left-to-right +/- chain
+     over {name} tokens only — no parentheses, no precedence, no * or /, no literal numbers (a real
+     field is the workaround for a constant). A formula's operands must be plain fields (or {span}/
+     {a}) — never another formula, so there is no dependency ordering or cycle handling to build;
+     see RW._dbAddFormula below for the two-direction chaining refusal this still requires. */
+
+  // "{a} + {b} - {c}" -> {names, ops} | null. Requires >= 2 operands (a single {name} would be a
+  // pure, always-blank alias — refused rather than silently useless); no modifier on any operand
+  // ({a:lower} is a render-time concern, never a value to compute with); no operators besides the
+  // bare + and -. Tolerant of missing/extra whitespace around every token.
+  RW._dbParseFormulaExpr = function(expr){
+    let rest = String(expr == null ? '' : expr).trim();
+    if (!rest) return null;
+    const names = [], ops = [];
+    for (;;){
+      const m = /^\{([A-Za-z][A-Za-z0-9_]*)\}/.exec(rest);
+      if (!m) return null;
+      names.push(m[1]);
+      rest = rest.slice(m[0].length).replace(/^\s+/, '');
+      if (!rest) break;
+      if (rest[0] !== '+' && rest[0] !== '-') return null; // no * / ( ) / literals — round 12 scope
+      ops.push(rest[0]);
+      rest = rest.slice(1).replace(/^\s+/, '');
+      if (!rest) return null; // dangling operator
+    }
+    return names.length >= 2 ? { names: names, ops: ops } : null;
+  };
+
+  // "{total} = {a} + {b}" -> {name, expr, names, ops} | null. The left-hand side must be exactly
+  // one bare {name} — no modifier (a formula's OWN name is never rendered with one; a modifier
+  // only ever applies where {total} is later USED, same as any other field).
+  RW._dbParseFormulaDefinition = function(raw){
+    const m = /^\{([A-Za-z][A-Za-z0-9_]*)\}\s*=\s*([^\n]+)$/.exec(String(raw == null ? '' : raw).trim());
+    if (!m) return null;
+    const expr = m[2].trim();
+    const parsed = RW._dbParseFormulaExpr(expr);
+    if (!parsed) return null;
+    return { name: m[1], expr: expr, names: parsed.names, ops: parsed.ops };
+  };
+
+  // Sums/subtracts left-to-right via the EXISTING RW._dbParseFtIn/RW._dbFormatFtIn (a negative
+  // total already formats with a leading "-"). Returns '' the instant ANY operand is missing or
+  // doesn't parse as feet-inches — no elaborate fallback table like RW._dbSpan's own
+  // datum/partial handling; a general formula has no comparable domain-specific fallback to reach
+  // for. Never throws.
+  RW._dbEvaluateFormula = function(formula, values){
+    if (!formula || !formula.names || !formula.names.length) return '';
+    values = values || {};
+    let total = 0;
+    for (let i = 0; i < formula.names.length; i++){
+      const key = formula.names[i];
+      const raw = Object.prototype.hasOwnProperty.call(values, key) ? values[key] : '';
+      const n = RW._dbParseFtIn(raw);
+      if (n == null) return '';
+      total += (i === 0 || formula.ops[i - 1] === '+') ? n : -n;
+    }
+    return RW._dbFormatFtIn(total);
+  };
+
+  // Evaluates every formula against a FROZEN pre-injection snapshot of `values`, never against its
+  // own partially-built output — what makes the compute path order-independent regardless of what
+  // RW._dbFormulas happens to contain (reachable from the console or hand-edited localStorage), so
+  // an illegal chain that somehow got saved degrades to blank instead of order-dependent garbage,
+  // rather than depending on validation being airtight everywhere it's reachable from.
+  RW._dbApplyFormulas = function(values){
+    values = values || {};
+    const list = RW._dbFormulas || [];
+    if (!list.length) return values; // zero-formula path is the SAME object — a provable no-op
+    const out = Object.assign({}, values);
+    for (const f of list) out[f.name] = RW._dbEvaluateFormula(f, values);
+    return out;
+  };
+
+  // A formula reading {span} needs it computed even in a template that never mentions {span}
+  // itself — used in place of RW._dbTemplateUsesSpan at both of that check's own call sites (the
+  // span gate in RW._dbComputeOutput and the span row's own visibility), so the Override button
+  // stays reachable too. With no formulas defined this is identical to RW._dbTemplateUsesSpan.
+  RW._dbNeedsSpan = function(templateText){
+    if (RW._dbTemplateUsesSpan(templateText)) return true;
+    return (RW._dbFormulas || []).some((f) => f.names.indexOf('span') !== -1);
+  };
+
   /* ---------- smart NS wording in the explanation (round 8) ----------
      If thickness (or the elevation — top=TOW, bot=TOF) is marked NS, the literal string "NS"
      spliced into the explanation sentence reads badly ("with the height of NS") and, worse, an
@@ -420,6 +513,23 @@
     if (idx >= lines.length) return renderedText;
     lines[idx] = prefix + override;
     return lines.join('\n');
+  };
+
+  // Round 12: the ONE place "inject computed values -> render -> apply the NS substitution" is
+  // spelled out, shared by RW._dbComputeOutput (the DOM path) and RW._dbDetectTemplate (round 6's
+  // template auto-detect, which independently reconstructs `values` for its own exact-match check)
+  // — the only two call sites that reach RW._dbRender in the whole file. Round 9 already showed
+  // what happens when this pipeline is duplicated instead of shared: RW._dbDetectTemplate was
+  // found missing the NS-substitution step entirely, mid-round. `values` must already carry
+  // `span` before this is called — the two callers legitimately derive it differently (a live
+  // span override + the span row vs. whatever the reverse parser recovered), so that stays at
+  // each call site; everything after it is single-sited here.
+  RW._dbRenderFinal = function(templateText, values){
+    const withFormulas = RW._dbApplyFormulas(values);
+    const rendered = RW._dbRender(templateText, withFormulas);
+    const botInfo = RW._dbParseBotThickness(withFormulas.bot);
+    const nsValues = botInfo ? Object.assign({}, withFormulas, { bot: botInfo.elevation }) : withFormulas;
+    return RW._dbApplyNsExplanation(rendered, templateText, nsValues);
   };
 
   /* ---------- reverse parser: recovers field values from an already-rendered description ---------- */
@@ -871,6 +981,72 @@
   // `input` listener ever write it.
   RW._dbDefaultTemplate = dbActiveTemplate().text;
 
+  /* ---------- round 12: formula field persistence — its own collection, mirroring the template
+     collection's own dbValidateTemplates/dbPersist shape, since formulas are GLOBAL (not tied to
+     one template, matching how {span}/{a} aren't either) ---------- */
+
+  RW._dbFormulasStorageKey = RW._dbFormulasStorageKey || 'rwDescFormulas';
+
+  // Drops malformed entries individually — never rejects the whole blob — reusing
+  // RW._dbParseFormulaDefinition as the single source of truth for what a valid formula looks
+  // like, so validation here can never drift from what RW._dbAddFormula itself accepts.
+  function dbValidateFormulas(list){
+    if (!Array.isArray(list)) return null;
+    const seen = new Set();
+    const out = [];
+    for (const entry of list){
+      if (!entry || typeof entry.name !== 'string' || typeof entry.expr !== 'string') continue;
+      const def = RW._dbParseFormulaDefinition('{' + entry.name.trim() + '} = ' + entry.expr);
+      if (!def) continue;
+      if (BUILTIN_DERIVED_NAMES[def.name]) continue;
+      if (def.names.indexOf(def.name) !== -1) continue; // self-reference
+      if (def.names.indexOf('a') !== -1) continue; // {a} the article can never be a value
+      const key = def.name.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(def);
+    }
+    // Second, order-independent pass: drop any entry built from another SURVIVING formula — no
+    // chaining, checked here the same way RW._dbAddFormula checks it at definition time, so a
+    // hand-edited/console-set collection can't sneak a chain in that validation would refuse.
+    const names = new Set(out.map((f) => f.name));
+    const kept = out.filter((f) => !f.names.some((n) => names.has(n)));
+    return kept.length ? kept : null;
+  }
+
+  function dbLoadFormulas(){
+    const raw = dbStorageGet(RW._dbFormulasStorageKey);
+    if (!raw) return null;
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch (e) { return null; }
+    return dbValidateFormulas(parsed);
+  }
+
+  // Persists only {name, expr} — names/ops are re-derived from expr on every load, never
+  // themselves stored, so a future parser change can't leave stale cached derivations behind.
+  // Removes the key entirely when the collection is empty, the natural analog of the template
+  // collection's own "a pristine collection has nothing worth remembering" rule (round 6) — there
+  // is no meaningful "default" formula set the way there's a built-in default template.
+  function dbPersistFormulas(){
+    if (!RW._dbFormulas.length){ dbStorageRemove(RW._dbFormulasStorageKey); return; }
+    try {
+      dbStorageSet(RW._dbFormulasStorageKey, JSON.stringify(RW._dbFormulas.map((f) => ({ name: f.name, expr: f.expr }))));
+    } catch (e) { /* an unstringifiable value is simply not saved — never throws */ }
+  }
+
+  // The ONE writer for DERIVED_NAMES' formula half — idempotent, so add, delete, load, and a
+  // console override all go through the same three lines and can never leave a stale derived
+  // name (from a formula that no longer exists) behind.
+  function dbSyncFormulaDerivedNames(){
+    for (const k of Object.keys(DERIVED_NAMES)) if (!BUILTIN_DERIVED_NAMES[k]) delete DERIVED_NAMES[k];
+    for (const f of RW._dbFormulas) DERIVED_NAMES[f.name] = true;
+  }
+
+  // Console override (RW._dbFormulas set before this module ran) wins over storage, matching the
+  // template collection's own precedent; otherwise a saved collection, otherwise none at all.
+  RW._dbFormulas = dbValidateFormulas(RW._dbFormulas) || dbLoadFormulas() || [];
+  dbSyncFormulaDerivedNames(); // before anything below ever calls RW._dbParseTemplate
+
   RW._dbSuggestions = RW._dbSuggestions || {
     word: ['height', 'depth'],
     source: ['schedule', 'plan and notes', 'detail'],
@@ -1004,18 +1180,11 @@
   RW._dbComputeOutput = function(){
     if (RW._dbOutputOverridden) return RW._dbOutputOverrideValue;
     const { templateText, values } = RW._dbCollectValues();
-    if (RW._dbTemplateUsesSpan(templateText)){
+    if (RW._dbNeedsSpan(templateText)){ // round 12 — also true when a live formula reads {span}
       const overrideVal = RW._dbSpanOverridden ? (RW._dbSpanOverrideValue || '') : '';
       values.span = RW._dbComputeSpanWithThickness(values.top || '', values.bot || '', overrideVal).value; // round 9
     }
-    const rendered = RW._dbRender(templateText, values);
-    // Round 9: the NS-explanation check (round 8) needs to see bot's EXTRACTED elevation, not its
-    // raw compound/bare-SLAB text — a bare "SLAB" bot has no elevation given either, so it must
-    // read as NS there too (RW._dbParseBotThickness already returns 'NS' for that shape); a
-    // compound bot's real extracted elevation (e.g. "0'-5\"") correctly stays "known".
-    const botInfo = RW._dbParseBotThickness(values.bot);
-    const nsValues = botInfo ? Object.assign({}, values, { bot: botInfo.elevation }) : values;
-    return RW._dbApplyNsExplanation(rendered, templateText, nsValues); // round 8 — smart NS wording
+    return RW._dbRenderFinal(templateText, values); // round 12 — shared with RW._dbDetectTemplate
   };
 
   RW._dbRunPreview = function(){
@@ -1119,7 +1288,7 @@
   RW._dbSyncSpanRow = function(templateText){
     const wrap = document.getElementById('rw-db-span-row');
     if (!wrap) return;
-    const uses = RW._dbTemplateUsesSpan(templateText);
+    const uses = RW._dbNeedsSpan(templateText); // round 12 — also true when a live formula reads {span}
     wrap.style.display = uses ? 'flex' : 'none';
     if (uses) RW._dbRenderSpanDisplay();
   };
@@ -1192,10 +1361,12 @@
     const templateWrap = document.getElementById('rw-db-template-wrap');
     const addVarWrap = document.getElementById('rw-db-addvar-wrap');
     const tplMgrWrap = document.getElementById('rw-db-tplmgr-wrap');
+    const formulaWrap = document.getElementById('rw-db-formula-wrap');
     const toggle = document.getElementById('rw-db-adv-toggle');
     if (templateWrap) templateWrap.style.display = RW._dbAdvanced ? '' : 'none';
     if (addVarWrap) addVarWrap.style.display = RW._dbAdvanced ? '' : 'none';
     if (tplMgrWrap) tplMgrWrap.style.display = RW._dbAdvanced ? '' : 'none';
+    if (formulaWrap) formulaWrap.style.display = RW._dbAdvanced ? '' : 'none';
     if (toggle) toggle.innerText = RW._dbAdvanced ? 'Simple' : 'Advanced';
     RW._dbApplyTemplateSelectVisibility();
   };
@@ -1237,6 +1408,7 @@
   RW._dbSetActiveTemplate = function(name, skipRebuild){
     const entry = dbFindTemplate(name);
     if (!entry) return;
+    RW._dbCancelSaveAsArm(); // a switch away from the armed target cancels any pending overwrite confirm
     RW._dbActiveTemplateName = entry.name;
     RW._dbDefaultTemplate = entry.text;
     const templateEl = document.getElementById('rw-db-template');
@@ -1246,42 +1418,106 @@
     if (!skipRebuild) RW._dbRebuildFields();
   };
 
-  // Shared validation for Save-as-new and Rename: refuse a blank name, a name over 40 characters,
-  // or a name already in use (case-insensitively) — reported inline via `statusEl` rather than
-  // silently ignored, matching RW._dbInsertVariable's own refusal discipline. `ignoreName` lets
-  // Rename validate against every OTHER entry without tripping over the active entry's own
-  // (about-to-be-replaced) name.
-  function dbValidTemplateName(name, statusEl, ignoreName){
+  // Shared basic validation for Save-as-new and Rename: refuse a blank name or one over 40
+  // characters — reported inline via `statusEl` rather than silently ignored, matching
+  // RW._dbInsertVariable's own refusal discipline. Duplicate-name handling is NOT here — Save-as-new
+  // and Rename now disagree on what a duplicate means (round 11), so each checks it separately.
+  function dbValidTemplateNameBasic(name, statusEl){
     name = (name || '').trim();
     if (!name){ if (statusEl) statusEl.innerText = 'give the template a name first'; return null; }
     if (name.length > 40){ if (statusEl) statusEl.innerText = 'template name is too long (40 characters max)'; return null; }
-    const dup = RW._dbTemplates.some((t) => t.name.toLowerCase() === name.toLowerCase() && t.name !== ignoreName);
-    if (dup){ if (statusEl) statusEl.innerText = '"' + name + '" already exists — pick a different name'; return null; }
     return name;
   }
 
-  // Saves the CURRENT template textarea's text as a brand-new named entry and selects it — the
-  // escape hatch for a source whose format doesn't match anything saved yet.
+  // Case-insensitive lookup for an existing entry named exactly `name`, ignoring `ignoreName` —
+  // lets Rename validate against every OTHER entry without tripping over the active entry's own
+  // (about-to-be-replaced) name; Save-as-new passes null (even the active entry's own name counts).
+  function dbFindTemplateByNameCI(name, ignoreName){
+    const key = name.toLowerCase();
+    for (const t of RW._dbTemplates) if (t.name.toLowerCase() === key && t.name !== ignoreName) return t;
+    return null;
+  }
+
+  // Round 11: a name that already belongs to another saved template no longer refuses outright —
+  // it offers to OVERWRITE that template's text with what's in the box. A two-click confirm, the
+  // same idiom RW._dbRunFill's own "Overwrite?" guard already uses on the Fill button: the first
+  // click arms and relabels THIS button; a second click on the SAME target name commits; changing
+  // the typed name, clicking elsewhere, or waiting the window out de-arms it.
+  RW._dbSaveAsArmed = false;
+  RW._dbSaveAsArmedName = '';
+
+  // Resets the arm flags/timer/button label only — never touches #rw-db-tpl-status, so a caller
+  // that's about to show its OWN status message right after (RW._dbSaveTemplateAs's own
+  // invalid-name path, which already wrote one via dbValidTemplateNameBasic) never gets it wiped.
+  function dbResetSaveAsButton(){
+    RW._dbSaveAsArmed = false;
+    RW._dbSaveAsArmedName = '';
+    clearTimeout(RW._dbSaveAsArmTimer);
+    const btn = document.getElementById('rw-db-tpl-saveas');
+    if (btn) btn.innerText = 'Save as new';
+  }
+
+  // The public, "this whole thing no longer applies" cancel — resets the button AND clears the
+  // status note. #rw-db-tpl-status is used only by the template-management row, so clearing it
+  // here unconditionally is safe for every OTHER caller (switching templates, reopening the modal,
+  // typing a new name) — none of them have their own status message to protect.
+  RW._dbCancelSaveAsArm = function(){
+    dbResetSaveAsButton();
+    const statusEl = document.getElementById('rw-db-tpl-status');
+    if (statusEl) statusEl.innerText = '';
+  };
+
+  // Saves the CURRENT template textarea's text as a named entry — a brand-new one, or (see above)
+  // overwriting an existing one by name — the escape hatch for a source whose format doesn't match
+  // anything saved yet, or whose saved version needs replacing outright.
   RW._dbSaveTemplateAs = function(rawName){
     const statusEl = document.getElementById('rw-db-tpl-status');
     const nameEl = document.getElementById('rw-db-tpl-name');
+    const btn = document.getElementById('rw-db-tpl-saveas');
     const templateEl = document.getElementById('rw-db-template');
-    const name = dbValidTemplateName(rawName, statusEl);
-    if (!name) return;
-    RW._dbTemplates.push({ name: name, text: templateEl ? templateEl.value : RW._dbDefaultTemplate });
-    RW._dbSetActiveTemplate(name);
-    if (statusEl) statusEl.innerText = '';
-    if (nameEl) nameEl.value = '';
+    const name = dbValidTemplateNameBasic(rawName, statusEl);
+    if (!name){ dbResetSaveAsButton(); return; }
+    const text = templateEl ? templateEl.value : RW._dbDefaultTemplate;
+
+    const existing = dbFindTemplateByNameCI(name, null);
+    if (!existing){
+      RW._dbCancelSaveAsArm(); // also clears status — nothing more specific to say than "saved"
+      RW._dbTemplates.push({ name: name, text: text });
+      RW._dbSetActiveTemplate(name);
+      if (nameEl) nameEl.value = '';
+      return;
+    }
+
+    if (RW._dbSaveAsArmed && RW._dbSaveAsArmedName.toLowerCase() === name.toLowerCase()){
+      RW._dbCancelSaveAsArm();
+      existing.text = text;
+      RW._dbSetActiveTemplate(existing.name);
+      if (nameEl) nameEl.value = '';
+      return;
+    }
+
+    RW._dbSaveAsArmed = true;
+    RW._dbSaveAsArmedName = name;
+    if (btn) btn.innerText = 'Overwrite?';
+    if (statusEl) statusEl.innerText = '"' + existing.name + '" already exists — click Overwrite again to replace its saved text';
+    clearTimeout(RW._dbSaveAsArmTimer);
+    RW._dbSaveAsArmTimer = setTimeout(RW._dbCancelSaveAsArm, 3000);
   };
 
   // Renames the ACTIVE entry in place (its text is untouched) and keeps the selection on it —
-  // same validation as Save as new.
+  // still refuses a duplicate outright (unlike Save-as-new above): renaming to merge two entries
+  // into one is a different, more involved operation than this button offers.
   RW._dbRenameTemplate = function(rawName){
     const statusEl = document.getElementById('rw-db-tpl-status');
     const nameEl = document.getElementById('rw-db-tpl-name');
+    RW._dbCancelSaveAsArm();
     const entry = dbActiveTemplate();
-    const name = dbValidTemplateName(rawName, statusEl, entry.name);
+    const name = dbValidTemplateNameBasic(rawName, statusEl);
     if (!name) return;
+    if (dbFindTemplateByNameCI(name, entry.name)){
+      if (statusEl) statusEl.innerText = '"' + name + '" already exists — pick a different name';
+      return;
+    }
     entry.name = name;
     RW._dbActiveTemplateName = name;
     dbPersist();
@@ -1294,6 +1530,7 @@
   // there must always be something selected.
   RW._dbDeleteTemplate = function(){
     const statusEl = document.getElementById('rw-db-tpl-status');
+    RW._dbCancelSaveAsArm();
     if (RW._dbTemplates.length <= 1){
       if (statusEl) statusEl.innerText = "can't delete the last remaining template";
       return;
@@ -1302,6 +1539,101 @@
     if (idx !== -1) RW._dbTemplates.splice(idx, 1);
     RW._dbSetActiveTemplate(RW._dbTemplates[0].name);
     if (statusEl) statusEl.innerText = '';
+  };
+
+  // Round 12: defines a new formula field from a raw "{total} = {a} + {b}" string. Validation
+  // order is deliberate — cheap, pure checks first, the one check that scans every saved
+  // template's text (the only non-O(1) one) last — reported inline via `statusEl` rather than
+  // silently ignored, matching every other refusal this file already has (RW._dbInsertVariable,
+  // RW._dbSaveTemplateAs). Two traps caught during design review, before any code existed: a
+  // formula that references its OWN name validates against every OTHER check and then can only
+  // ever be blank, forever (its own name is derived the instant it's added, so it can never get a
+  // field); and the no-chaining rule needs checking in BOTH directions — an operand that's
+  // already a formula, and a new name that's already used as an operand by an EXISTING formula
+  // (defining {t}={a}+{b} first, then trying to define {b}={c}+{d}, is the same problem from the
+  // other side).
+  RW._dbAddFormula = function(rawName){
+    const statusEl = document.getElementById('rw-db-formula-status');
+    const inputEl = document.getElementById('rw-db-formula-input');
+    function fail(msg){ if (statusEl) statusEl.innerText = msg; }
+
+    const raw = String(rawName == null ? '' : rawName).trim();
+    const def = RW._dbParseFormulaDefinition(raw);
+    if (!def){
+      // Distinguish "the whole shape is wrong" from "just the right-hand side is wrong" without a
+      // second parser — if a bare {name} = ... shape is present at all, the expression is the
+      // specific problem.
+      const shapeOk = /^\{[A-Za-z][A-Za-z0-9_]*\}\s*=\s*.+$/.test(raw);
+      fail(shapeOk
+        ? 'the right-hand side must be two or more {field} names joined only by + or -'
+        : 'a formula looks like {total} = {a} + {b}');
+      return;
+    }
+    if (def.name.length > 40){ fail('the formula name is too long (40 characters max)'); return; }
+    if (BUILTIN_DERIVED_NAMES[def.name]){ fail('"' + def.name + '" is reserved — pick a different name'); return; }
+    const dup = RW._dbFormulas.find((f) => f.name.toLowerCase() === def.name.toLowerCase());
+    if (dup){ fail('a formula named "' + dup.name + '" already exists — delete it first'); return; }
+    if (def.names.indexOf(def.name) !== -1){
+      fail("a formula can't use its own name — {" + def.name + '} is what it defines');
+      return;
+    }
+    const chainedOperand = def.names.find((n) => RW._dbFormulas.some((f) => f.name === n));
+    if (chainedOperand){
+      fail('"' + chainedOperand + '" is itself a formula — a formula can\'t be built from another one');
+      return;
+    }
+    const usedAsOperandBy = RW._dbFormulas.find((f) => f.names.indexOf(def.name) !== -1);
+    if (usedAsOperandBy){
+      fail('"' + def.name + '" is already used inside the formula for "' + usedAsOperandBy.name + '" — a formula can\'t be built from another one');
+      return;
+    }
+    if (def.names.indexOf('a') !== -1){
+      fail('"a" is the a/an article, not a value — it can\'t be used in a formula');
+      return;
+    }
+    // Prevents a formula from silently breaking an EXISTING template that already uses this name
+    // as a real, annotator-typed field — including the live unsaved textarea, which is already
+    // covered here since its own `input` listener writes into the active entry on every keystroke.
+    const collision = RW._dbTemplates.find((t) => RW._dbParseTemplate(t.text).indexOf(def.name) !== -1);
+    if (collision){
+      fail('"' + def.name + '" is already a field in the template "' + collision.name + '" — remove it there first, or pick a different name');
+      return;
+    }
+
+    RW._dbFormulas.push(def);
+    dbSyncFormulaDerivedNames();
+    dbPersistFormulas();
+    RW._dbRenderFormulaList();
+    if (inputEl) inputEl.value = '';
+    fail('');
+    RW._dbRebuildFields(); // a newly-registered derived name can change which fields show
+  };
+
+  // Exact-name removal, no confirm — matches RW._dbDeleteTemplate's own no-confirm precedent.
+  RW._dbDeleteFormula = function(name){
+    const idx = RW._dbFormulas.findIndex((f) => f.name === name);
+    if (idx === -1) return;
+    RW._dbFormulas.splice(idx, 1);
+    dbSyncFormulaDerivedNames();
+    dbPersistFormulas();
+    RW._dbRenderFormulaList();
+    RW._dbRebuildFields();
+  };
+
+  // Rebuilds #rw-db-formula-list from scratch: one row per formula, "{name} = expr" plus its own
+  // Delete button. Called once at panel build and again after every add/delete.
+  RW._dbRenderFormulaList = function(){
+    const list = document.getElementById('rw-db-formula-list');
+    if (!list) return;
+    clearChildren(list);
+    for (const f of RW._dbFormulas){
+      const row = mkEl('div', { id: 'rw-db-formula-row-' + f.name },
+        'display:flex;align-items:center;gap:4px;font-size:11px;margin:2px 0;');
+      row.appendChild(mkEl('span', { innerText: '{' + f.name + '} = ' + f.expr }, 'flex:1;'));
+      row.appendChild(mkBtn('rw-db-formula-del-' + f.name, 'Delete', 'Delete this formula field',
+        () => RW._dbDeleteFormula(f.name)));
+      list.appendChild(row);
+    }
   };
 
   // The escape hatch a saved/edited template needs: without this, a bad or unwanted custom
@@ -1345,15 +1677,11 @@
       // so a description using a bot-embedded slab thickness still reconstructs correctly.
       const span = result.span ? result.span.text : RW._dbComputeSpanWithThickness(result.values.top || '', result.values.bot || '', '').value;
       const values = Object.assign({}, result.values, { span: span });
-      // Same substitution RW._dbComputeOutput applies — the NS-explanation check needs bot's
-      // EXTRACTED elevation, not its raw compound/bare-SLAB text (see there for why).
-      const botInfo = RW._dbParseBotThickness(values.bot);
-      const nsValues = botInfo ? Object.assign({}, values, { bot: botInfo.elevation }) : values;
       let rendered;
-      try {
-        rendered = RW._dbRender(entry.text, values);
-        rendered = RW._dbApplyNsExplanation(rendered, entry.text, nsValues); // round 8 — was missing here
-      }
+      // Round 12: RW._dbRenderFinal, not a separate render+NS call — the single function
+      // RW._dbComputeOutput also uses, so a formula's value (and any future addition to that
+      // pipeline) is reconstructed here too, without this call site needing its own copy of it.
+      try { rendered = RW._dbRenderFinal(entry.text, values); }
       catch (e){ rendered = null; }
 
       const cand = { name: entry.name, result: result, exact: rendered === desc };
@@ -1391,6 +1719,13 @@
 
     if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(name)){
       fail('a variable name must start with a letter and contain only letters, numbers, or _');
+      return;
+    }
+    // Round 12: DERIVED_NAMES now also contains every formula name, so a plain "reserved" message
+    // would be misleading once a formula exists — check that case first and say so specifically.
+    const asFormula = RW._dbFormulas.find((f) => f.name === name);
+    if (asFormula){
+      fail('"' + name + '" is a formula — delete the formula first, or pick a different name');
       return;
     }
     if (DERIVED_NAMES[name]){
@@ -1431,7 +1766,7 @@
   // within that window commits. Protects a hand-written description from a stray click.
   RW._dbRunFill = function(modal){
     const descInp = modal.querySelector('#label-description');
-    const btn = modal.querySelector('#rw-db-fill');
+    const btn = document.getElementById('rw-db-fill'); // round 10 — may float outside the modal
     if (!descInp) return;
 
     if (descInp.value && descInp.value.trim() && !RW._dbFillArmed){
@@ -1487,11 +1822,14 @@
   }
 
   RW._dbResetFields = function(modal, prefill){
-    const templateEl = modal.querySelector('#rw-db-template');
+    // round 10 — document.getElementById, not modal.querySelector: the panel may now float
+    // outside the modal's own DOM subtree, where a modal-scoped lookup would silently miss.
+    const templateEl = document.getElementById('rw-db-template');
     if (templateEl) templateEl.value = RW._dbDefaultTemplate;
     RW._dbFillArmed = false;
-    const fillBtn = modal.querySelector('#rw-db-fill');
+    const fillBtn = document.getElementById('rw-db-fill');
     if (fillBtn) fillBtn.innerText = 'Fill Description';
+    RW._dbCancelSaveAsArm(); // a fresh open never carries over a stale overwrite confirmation
     applyPrefill(prefill);
   };
 
@@ -1541,7 +1879,10 @@
   RW._dbBuildPanel = function(modal){
     const descInp = modal.querySelector('#label-description');
     if (!descInp) return;
-    if (modal.querySelector('#rw-db-root')) return; // idempotent — already injected
+    // round 10 — document.getElementById, not modal.querySelector: once the panel has floated
+    // outside the modal (RW._dbPositionPanel), a modal-scoped check would always miss and a
+    // SECOND panel would get built on every later open.
+    if (document.getElementById('rw-db-root')) return; // idempotent — already injected
 
     ensureStyle();
 
@@ -1608,9 +1949,13 @@
     // one, Delete it, or reset just the current one back to the built-in text.
     const tplMgrWrap = mkEl('div', { id: 'rw-db-tplmgr-wrap' },
       'margin-bottom:4px;display:flex;gap:4px;align-items:center;flex-wrap:wrap;');
-    tplMgrWrap.appendChild(mkEl('input', { type: 'text', id: 'rw-db-tpl-name', placeholder: 'template name' }, 'width:110px;font-size:11px;'));
+    const tplNameEl = mkEl('input', { type: 'text', id: 'rw-db-tpl-name', placeholder: 'template name' }, 'width:110px;font-size:11px;');
+    // Typing after an "Overwrite?" arm cancels it — a changed name shouldn't silently confirm
+    // overwriting whatever the PREVIOUS name pointed to.
+    tplNameEl.addEventListener('input', () => RW._dbCancelSaveAsArm());
+    tplMgrWrap.appendChild(tplNameEl);
     tplMgrWrap.appendChild(mkBtn('rw-db-tpl-saveas', 'Save as new',
-      'Save the template text above as a brand-new named template',
+      'Save the template text above under this name — a brand-new template, or (with confirmation) overwriting an existing one',
       () => RW._dbSaveTemplateAs(document.getElementById('rw-db-tpl-name').value)));
     tplMgrWrap.appendChild(mkBtn('rw-db-tpl-rename', 'Rename',
       'Rename the current template (its text is unchanged)',
@@ -1629,6 +1974,20 @@
     addVarWrap.appendChild(mkBtn('rw-db-addvar-insert', 'Insert', "Add {name} to the template at the caret, seeded with this value", () => RW._dbInsertVariable()));
     addVarWrap.appendChild(mkEl('span', { id: 'rw-db-addvar-status' }, 'font-size:10px;opacity:0.8;'));
     body.appendChild(addVarWrap);
+
+    // Round 12: formula fields — a computed field defined once, usable in ANY saved template,
+    // like {span}/{a} already are. Never auto-spliced into the current template (unlike Insert
+    // above) — the annotator types {name} into whichever template(s) want it, matching how {span}
+    // itself is already used today.
+    const formulaWrap = mkEl('div', { id: 'rw-db-formula-wrap' },
+      'margin-bottom:4px;display:flex;gap:4px;align-items:center;flex-wrap:wrap;');
+    formulaWrap.appendChild(mkEl('input', { type: 'text', id: 'rw-db-formula-input', placeholder: '{total} = {a} + {b}' }, 'width:160px;font-size:11px;'));
+    formulaWrap.appendChild(mkBtn('rw-db-formula-add', 'Add formula',
+      'Define a computed field from other fields — usable in any saved template',
+      () => RW._dbAddFormula(document.getElementById('rw-db-formula-input').value)));
+    formulaWrap.appendChild(mkEl('span', { id: 'rw-db-formula-status' }, 'font-size:10px;opacity:0.8;'));
+    formulaWrap.appendChild(mkEl('div', { id: 'rw-db-formula-list' }, 'width:100%;'));
+    body.appendChild(formulaWrap);
 
     // Inline prefill report — lives OUTSIDE the Advanced-only wrappers on purpose: prefilling an
     // Edit label is an everyday Simple-mode event, and the annotator has to be told when these
@@ -1678,7 +2037,71 @@
     RW._dbApplyPanelExpanded();
     RW._dbApplyOutputOverrideUI();
     RW._dbRenderTemplateSelect();
+    RW._dbRenderFormulaList();
     RW._dbRebuildFields();
+  };
+
+  /* ---------- round 10: float the panel beside the modal when there's room ----------
+     Every row this panel adds pushes the host modal's own content down when mounted inline above
+     Description. When there's enough room to the modal's right, dock it there instead —
+     ATTACHED to the modal (appears/disappears with it, computed once per open) rather than a
+     fully independent always-on floating panel; falls back to today's exact inline mount on a
+     narrow viewport. Ported from boon-label-management's own floating panel (document.body mount,
+     position:fixed, an explicit top/left so it can never fall back to its static position and
+     land off-screen — a real bug that repo hit once), with one genuinely new piece that repo has
+     no precedent for: visibility synced to a host modal's own show/hide (see
+     RW._dbApplyPanelVisibility below) — being a DOM descendant used to give that for free. */
+
+  RW._dbFloatWidth = RW._dbFloatWidth != null ? RW._dbFloatWidth : 320;
+  RW._dbFloatGap = RW._dbFloatGap != null ? RW._dbFloatGap : 12;
+
+  // Decides float-vs-inline and applies it. Called ONCE per fresh modal open (from
+  // onLabelModalMutation's hidden→visible edge) — deliberately not tracked continuously (no
+  // resize listener, no re-check while the modal stays open), matching the user's own choice.
+  // Both branches unconditionally re-parent — appendChild/insertAdjacentElement are safe no-ops
+  // when the root is already in place, so there's no need to check current parentage first.
+  RW._dbPositionPanel = function(modal){
+    const root = document.getElementById('rw-db-root');
+    const descInp = modal.querySelector('#label-description');
+    if (!root || !descInp) return;
+
+    const modalRect = modal.getBoundingClientRect();
+    const available = window.innerWidth - modalRect.right;
+
+    if (available >= RW._dbFloatWidth + RW._dbFloatGap){
+      document.body.appendChild(root);
+      root.style.position = 'fixed';
+      root.style.top = Math.max(0, modalRect.top) + 'px';
+      root.style.left = (modalRect.right + RW._dbFloatGap) + 'px';
+      root.style.width = RW._dbFloatWidth + 'px';
+      root.style.maxHeight = Math.min(modalRect.height, window.innerHeight * 0.8) + 'px';
+      root.style.marginBottom = '0';
+      root.style.zIndex = '2147483646'; // one below the 32-bit max — same constant this family's
+                                          // own floating panel (boon-label-management) already uses
+    } else {
+      root.style.position = '';
+      root.style.top = '';
+      root.style.left = '';
+      root.style.width = '';
+      root.style.maxHeight = '40vh';
+      root.style.marginBottom = '6px';
+      root.style.zIndex = '';
+      descInp.insertAdjacentElement('beforebegin', root);
+    }
+  };
+
+  // Keeps the root's OWN display in sync with the modal's — free when inline (a hidden ancestor
+  // already hides its descendants; this is a harmless no-op there), load-bearing when floating
+  // (a document.body sibling gets no visibility inheritance from the modal at all). Called on
+  // EVERY mutation, not just the fresh-open edge, and deliberately NOT gated by the
+  // RW._ocrBoxDrawing skip-reset latch — that latch protects FIELD VALUES from a transient
+  // OCR-Box-induced hide, which has nothing to do with the panel's own show/hide, and the host's
+  // own modal genuinely does blink hidden during that gesture, so the panel blinking with it is
+  // the visually consistent behavior, not something to guard against.
+  RW._dbApplyPanelVisibility = function(modal){
+    const root = document.getElementById('rw-db-root');
+    if (!root) return;
+    root.style.display = modalVisible(modal) ? '' : 'none';
   };
 
   // Composes the inline prefill-status wording — pure, so it's unit-testable without a DOM.
@@ -1796,6 +2219,7 @@
     if (!nowVisible && RW._ocrBoxDrawing) dbHiddenWhileBoxDrawing = true;
     if (nowVisible && !dbWasVisible){
       RW._dbMaybeInject(modal);
+      RW._dbPositionPanel(modal); // round 10 — float vs inline, computed once per fresh open
       const skipReset = dbHiddenWhileBoxDrawing;
       dbHiddenWhileBoxDrawing = false;
       if (isModalEligible(modal) && !skipReset){
@@ -1821,6 +2245,7 @@
         RW._dbResetFields(modal, prefill);
       }
     }
+    RW._dbApplyPanelVisibility(modal); // round 10 — keep the (possibly floating) panel in sync
     dbWasVisible = nowVisible;
   }
 
