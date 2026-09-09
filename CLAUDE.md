@@ -30,7 +30,7 @@ synthetic harness `verify_desc.js` is the whole verification story.
 ```bash
 bash build_loader.sh          # rebuilds desc_loader.js (runs node --check on the result)
 node --check rw_descbuilder.js
-node verify_desc.js           # synthetic harness — 227 tests, all passing
+node verify_desc.js           # synthetic harness — 247 tests, all passing
 ```
 
 To actually verify a change works, it has to be pasted into a real annotation-job page in Chrome
@@ -236,6 +236,9 @@ a direct port, not a reinvention:
   and reusing the preserving path for a fresh modal open was a real bug caught in round 1's own
   spot-check (below). `seed` (round 4) is how a prefill's recovered values reach the inputs without
   a second rebuild function to keep in sync with `preserve` — same precedent, same reason.
+  **Except** when `RW._ocrBoxDrawing` (round 5, `boon-ocr`'s shared flag for its OCR Box gesture)
+  was observed true while hidden — see round 5 above for why that transition must NOT count as a
+  real reopen, and why the flag can't be checked at the moment visibility is restored.
 - **Mount point**: `descInp.insertAdjacentElement('beforebegin', root)` — directly above
   Description, never touching `boon-ocr`'s own controls (which mount `afterend`, on the far side).
 - **Style**: one injected `<style id="rw-db-style">` setting both `color` and `background`
@@ -491,6 +494,114 @@ predate this round's template entirely — recover as cleanly as the synthetic f
 mostly fall back to the "does not match" / partial cases; and whether 40 recovered fields and a new
 status row still fit comfortably under the existing 40vh height cap on a real, possibly small
 laptop viewport.
+
+## Round 5 — OCR Box was wiping the builder; the custom template now persists
+
+Two independent user requests this round.
+
+### Bug: `boon-ocr`'s "OCR Box" flow was clearing the builder
+
+Reported: using `boon-ocr`'s **OCR Box** button (the one right next to plain **OCR** — easy to
+conflate in a bug report, and it was) wiped out whatever had already been typed into the builder.
+
+**Root cause, confirmed by reading `boon-ocr/rw_ocr.js` directly, not inferred**:
+`armOcrBoxDraw`/`finishOcrBoxDraw` (that repo's handlers for drawing a tighter OCR crop region on
+the canvas) hide `#label-modal` with a plain inline `style.display = 'none'` while the annotator
+clicks 4 corner points, then restore it — a *live-verified* feature of that repo, not a bug there.
+This add-on's own `MutationObserver` (`:1199`, watching `class`/`hidden`/`style` on that same
+element) and `modalVisible()` (`:1136-1143`, which treats a computed `display:none` as hidden)
+cannot tell that apart from the host genuinely closing and reopening the dialog — every restore
+looked exactly like a fresh open, so `onLabelModalMutation` fired `RW._dbResetFields` and wiped
+the builder every time. The plain **OCR** button was never able to reach this path at all — it
+never mutates `#label-modal`'s `class`/`hidden`/`style`, and this add-on has no listener on
+`#label-description` itself.
+
+**Fixed entirely within `boon-desc-manager` — no change to `boon-ocr`.** `boon-ocr` already sets
+a shared, `window.__RW`-namespaced flag for the whole box-drawing gesture, `RW._ocrBoxDrawing`
+(true from `armOcrBoxDraw` until `finishOcrBoxDraw`). Reading it is a soft, optional, read-only
+cross-repo coordination — a no-op when `boon-ocr` isn't pasted at all — matching this family's own
+existing precedent for such reads (`boon-ocr` itself defensively reads a workbench flag the same
+way, per its own CLAUDE.md). The one real subtlety: it can't be checked at the moment visibility
+is *restored*, because a `MutationObserver` callback is delivered as a microtask after the whole
+synchronous handler that caused the mutation finishes, and `finishOcrBoxDraw` sets
+`RW._ocrBoxDrawing = false` **before** restoring the display — by the time this add-on's callback
+runs for that restore, the flag has already flipped back to `false`. The fix instead **latches**
+the flag while the modal is genuinely hidden (any callback firing during that window, including
+the hide transition itself, still sees it `true`) and consumes the latch exactly once on the next
+visible transition — `dbHiddenWhileBoxDrawing` in `onLabelModalMutation` (`:1168-1207`). A
+genuine reopen right after an OCR-Box-suppressed one still resets normally; the skip never sticks.
+
+Existing tests `9k`/`17g`/`17h` never set `RW._ocrBoxDrawing`, so this guard is a no-op for every
+scenario they cover — they needed no changes.
+
+Verification: `verify_desc.js` grew a new section 18 — a hidden→visible flip latched during OCR
+Box drawing leaves a typed field untouched on both Create and Edit modals; the very next genuine
+hidden→visible transition still resets normally (the skip is one-shot); and with
+`RW._ocrBoxDrawing` never set at all, behavior is unchanged. Spot-checked: removed the
+`&& !skipReset` guard and confirmed *exactly* the two OCR-Box tests failed, with `9k`/`17g`/`17h`
+staying green; restored.
+
+**Not yet live-verified**: the fix on a real page with `boon-ocr`'s actual OCR Box gesture (only
+the confirmed mechanism — `style.display` toggled on `#label-modal` while `RW._ocrBoxDrawing` is
+true — is exercised synthetically).
+
+### Feature: the Advanced-mode custom template now persists across a reload
+
+**A deliberate, confirmed deviation from this whole family's stated no-persistence-across-reloads
+convention** — the same procedural pattern `boon-tagger-darkmode`'s own CLAUDE.md records for its
+`localStorage`-backed theme toggle: surfaced to the user explicitly before implementation (not
+defaulted silently), and shipped **on by default**, not behind a console flag, since hiding it
+behind an opt-in would defeat the point (removing the "retype it every session" friction).
+Confirmed scope: the template text only — Advanced-mode on/off, Remember Values, and the panel's
+collapsed/expanded state all stay session-only, unchanged.
+
+**A gap found while designing this**: the template didn't even survive a same-session modal
+reopen before this round, let alone a reload. `RW._dbResetFields` always stomped
+`#rw-db-template`'s value back to the built-in default on every open (documented as intentional in
+round 4 — "`Re-read` is the deliberate escape hatch"), and nothing ever wrote a live template edit
+back into `RW._dbDefaultTemplate`. Fixing genuine cross-reload persistence meant fixing this too,
+with one mechanism: **`RW._dbDefaultTemplate` is now the thing kept current**, both in memory and
+in storage, rather than a fixed constant. `RW._dbBuiltinDefaultTemplate` is the new fixed constant
+(what the default template literal used to be) — introduced so a "Reset to default" action has
+something to reset *to*.
+
+Storage follows `boon-tagger-darkmode/rw_darkmode.js`'s exact pattern (`storageGet`/`storageSet`,
+`:118-124` there) — the one existing family precedent for this: plain string values, no JSON, a
+`try/catch` around both get and set that degrades silently to in-memory-only on a private window
+or blocked site data, and the key name itself on a console-overridable var
+(`RW._dbTemplateStorageKey`, default `'rwDescTemplate'`). Layering, in priority order: a console
+override set before this module ever ran (unchanged, pre-existing `||` behavior) → a template
+saved in a previous session → the built-in default. A blank/whitespace-only stored value is
+treated as nothing having been saved, never as an intentional blank template.
+
+The template textarea's own `input` listener (`RW._dbBuildPanel`) is the one place an edit flows
+through, so it's also the one place that now both updates `RW._dbDefaultTemplate` and saves it —
+`RW._dbResetFields`'s existing stomp-to-default and `RW._dbReadPrefill`'s existing
+parse-against-default both automatically pick up the saved/edited template for free, with no
+changes needed to either.
+
+**A "Reset to default" button was added as a required safety net, not an optional nicety** —
+without it, a bad or unwanted custom template would be permanently stuck, surviving even a
+re-paste of the loader, with no in-UI way back to the built-in one.
+`RW._dbResetTemplateToDefault` clears storage and restores `RW._dbBuiltinDefaultTemplate`; the
+button sits next to the template textarea, Advanced mode only.
+
+Verification: `verify_desc.js` grew a new section 19 (and gained a `localStorage` stub, ported
+from `boon-tagger-darkmode/verify_dark.js`'s own `makeStorage(opts)` factory — this repo's harness
+never needed one before). Covers: a seeded stored value becoming the effective default at install
+and appearing in the textarea; an edit being saved under the console-overridable key; a throwing
+`localStorage` never crashing install or a later edit, falling back to the built-in default; a
+pre-set console override winning over a seeded stored value; the same-session gap this round
+closes directly (edit, close, reopen — the edit survives); Reset to default restoring the exact
+built-in text and clearing storage; and a whitespace-only stored value falling back to the
+built-in default rather than an unusable blank template. Spot-checked: reverted the textarea
+listener to its old rebuild-only body and confirmed exactly the save/same-session-survival tests
+failed; separately neutered `RW._dbResetTemplateToDefault` to a no-op and confirmed exactly its
+own three tests failed; both restored.
+
+**Not yet live-verified**: whether `localStorage` behaves identically on the real page (no reason
+to expect otherwise, but not directly observed) and whether a genuinely large or malformed custom
+template ever produces a confusing state Reset to default doesn't cleanly resolve.
 
 ## Constraints (do not violate)
 

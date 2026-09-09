@@ -582,15 +582,49 @@
     };
   };
 
+  /* ---------- template persistence (deliberate deviation from this family's no-persistence
+     convention, confirmed with the user — see CLAUDE.md) — never throws, private window /
+     blocked site data degrades silently to in-memory only, matching boon-tagger-darkmode's own
+     storageGet/storageSet pattern ---------- */
+
+  RW._dbTemplateStorageKey = RW._dbTemplateStorageKey || 'rwDescTemplate';
+
+  function dbStorageGet(key){
+    try { return window.localStorage.getItem(key); } catch (e) { return null; }
+  }
+  function dbStorageSet(key, val){
+    try { window.localStorage.setItem(key, val); } catch (e) { /* no-op */ }
+  }
+  function dbStorageRemove(key){
+    try { window.localStorage.removeItem(key); } catch (e) { /* no-op */ }
+  }
+
   /* ---------- default template + suggestion lists (console-overridable) ---------- */
 
-  RW._dbDefaultTemplate = RW._dbDefaultTemplate || [
+  // The fixed, built-in template — what RW._dbResetTemplateToDefault always restores, regardless
+  // of whatever the annotator has since typed or had saved from a previous session.
+  RW._dbBuiltinDefaultTemplate = RW._dbBuiltinDefaultTemplate || [
     '{desc} - {keyword}',
     '{source}',
     '{word}: {top:brk} - {bot:brk}',
     'thickness: {thickness}',
     'explanation: The detail shows {a} {thickness} {desc:lower} {keyword:lower} with the {word} of {span}. the thickness can be found in {source} table within the same page while the {word} can be found in {where}',
   ].join('\n');
+
+  // The CURRENT effective default — what a fresh modal open resets the template box to (see
+  // RW._dbResetFields) and what RW._dbReadPrefill parses a fresh Edit description against.
+  // Layered, in priority order: a console override set before this module ever ran (the `||`
+  // below) — unchanged, existing behavior — then a template saved in a previous session, then
+  // the built-in default. A blank/whitespace-only stored value is treated as nothing having been
+  // saved, never as an intentional blank template. Kept current by the template textarea's own
+  // `input` listener (RW._dbBuildPanel), which is also the one place that saves it back out —
+  // so editing the template now survives both a same-session modal reopen (a gap that predates
+  // this feature — RW._dbResetFields always stomped the box back to the ORIGINAL built-in
+  // default, discarding any edit) and, via storage, an actual page reload.
+  RW._dbDefaultTemplate = RW._dbDefaultTemplate || (function(){
+    const stored = dbStorageGet(RW._dbTemplateStorageKey);
+    return (stored && stored.trim()) ? stored : RW._dbBuiltinDefaultTemplate;
+  })();
 
   RW._dbSuggestions = RW._dbSuggestions || {
     word: ['height', 'depth'],
@@ -855,6 +889,17 @@
     if (toggle) toggle.innerText = RW._dbAdvanced ? 'Simple' : 'Advanced';
   };
 
+  // The escape hatch a saved/edited template needs: without this, a bad or unwanted custom
+  // template would be permanently stuck, surviving even a re-paste of the loader, with no in-UI
+  // way back to the built-in one.
+  RW._dbResetTemplateToDefault = function(){
+    RW._dbDefaultTemplate = RW._dbBuiltinDefaultTemplate;
+    dbStorageRemove(RW._dbTemplateStorageKey);
+    const templateEl = document.getElementById('rw-db-template');
+    if (templateEl) templateEl.value = RW._dbDefaultTemplate;
+    RW._dbRebuildFields();
+  };
+
   // Splices {name} into the template at its current caret (or over its selection), seeded with
   // the typed value once the field appears. Refuses a malformed name, a derived name ('span'/'a'),
   // or a duplicate of a name already in the template — reported inline, never silently dropped
@@ -1042,12 +1087,22 @@
     const body = mkEl('div', { id: 'rw-db-body' });
 
     const templateWrap = mkEl('div', { id: 'rw-db-template-wrap' }, 'margin-bottom:4px;');
-    templateWrap.appendChild(mkEl('div', { innerText: 'Template (edit freely — {name} becomes a field):' },
+    templateWrap.appendChild(mkEl('div', { innerText: 'Template (edit freely — {name} becomes a field; saved automatically):' },
       'font-size:10px;opacity:0.7;'));
     const templateEl = mkEl('textarea', { id: 'rw-db-template', rows: 6, value: RW._dbDefaultTemplate },
       'width:98%;font-size:11px;font-family:monospace;');
-    templateEl.addEventListener('input', () => RW._dbRebuildFields());
+    // Every edit becomes the new effective default (RW._dbDefaultTemplate) AND is saved to
+    // localStorage — the one place a template edit flows through, so this is also what makes an
+    // edited template survive a same-session modal reopen, not just an actual page reload (see
+    // the persistence comment above RW._dbDefaultTemplate's own declaration).
+    templateEl.addEventListener('input', () => {
+      RW._dbDefaultTemplate = templateEl.value;
+      dbStorageSet(RW._dbTemplateStorageKey, templateEl.value);
+      RW._dbRebuildFields();
+    });
     templateWrap.appendChild(templateEl);
+    templateWrap.appendChild(mkBtn('rw-db-template-reset', 'Reset to default',
+      'Restore the built-in template and forget anything saved', () => RW._dbResetTemplateToDefault()));
     body.appendChild(templateWrap);
 
     const addVarWrap = mkEl('div', { id: 'rw-db-addvar-wrap' },
@@ -1169,13 +1224,34 @@
   // either blank (Create) or prefilled from what's actually there (Edit) — a stale value from the
   // label just closed must never bleed into the next one either way.
   let dbWasVisible = false;
+  // Latched true if RW._ocrBoxDrawing — boon-ocr's shared flag, marking its "OCR Box" crop-region
+  // gesture — was observed true at any point while the modal was hidden. boon-ocr's OCR Box hides
+  // this same #label-modal (a plain inline style.display:none) while the annotator clicks corner
+  // points on the canvas, then restores it; this add-on's own MutationObserver (watching
+  // class/hidden/style, same as boon-ocr's) can't tell that apart from the host genuinely closing
+  // and reopening the dialog, and used to wipe the builder's fields every time. Reading
+  // RW._ocrBoxDrawing is a soft, optional, read-only cross-repo coordination — a no-op (always
+  // false) when boon-ocr isn't pasted at all, matching this family's existing precedent for such
+  // reads (boon-ocr itself defensively reads a workbench flag the same way).
+  //
+  // Checked here, NOT at the moment visibility is restored: a MutationObserver callback is
+  // delivered as a microtask after the whole synchronous handler that caused the mutation
+  // finishes, and boon-ocr's finishOcrBoxDraw sets RW._ocrBoxDrawing = false BEFORE restoring the
+  // display — by the time this callback runs for that restore, the flag has already flipped back
+  // to false. Latching it while genuinely hidden (any callback that fires during that window,
+  // including the hide transition itself, still sees it true) and consuming the latch exactly
+  // once on the next visible transition sidesteps that timing gap entirely.
+  let dbHiddenWhileBoxDrawing = false;
   function onLabelModalMutation(){
     const modal = document.getElementById('label-modal');
     if (!modal) return;
     const nowVisible = modalVisible(modal);
+    if (!nowVisible && RW._ocrBoxDrawing) dbHiddenWhileBoxDrawing = true;
     if (nowVisible && !dbWasVisible){
       RW._dbMaybeInject(modal);
-      if (isModalEligible(modal)){
+      const skipReset = dbHiddenWhileBoxDrawing;
+      dbHiddenWhileBoxDrawing = false;
+      if (isModalEligible(modal) && !skipReset){
         let prefill = null;
         if (modalIsEdit(modal)){
           // Always parsed against the DEFAULT template, not #rw-db-template's current value —

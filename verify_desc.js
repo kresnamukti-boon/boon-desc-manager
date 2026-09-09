@@ -148,11 +148,27 @@ function makeStubWindow(){
     },
   };
 
+  // Ported verbatim from boon-tagger-darkmode/verify_dark.js — the one sibling with its own
+  // localStorage-backed feature already tested this way. `opts.throwing` simulates a private
+  // window / blocked site data (both getItem and setItem throw); removeItem never throws, since
+  // nothing in either repo relies on a throwing removeItem to test a real failure path.
+  function makeStorage(opts){
+    opts = opts || {};
+    const data = {};
+    return {
+      getItem(k){ if (opts.throwing) throw new Error('blocked'); return Object.prototype.hasOwnProperty.call(data, k) ? data[k] : null; },
+      setItem(k, v){ if (opts.throwing) throw new Error('blocked'); data[k] = String(v); },
+      removeItem(k){ delete data[k]; },
+      _data: data,
+    };
+  }
+
   const winListeners = {};
   const win = {
     document: documentStub,
     innerWidth: 1200,
     innerHeight: 800,
+    localStorage: makeStorage(),
     getComputedStyle(el){
       return { display: (el && el.style && el.style.display) || '', visibility: 'visible' };
     },
@@ -168,7 +184,7 @@ function makeStubWindow(){
     },
   };
 
-  return { win, doc: documentStub, byId: (id) => registry.get(id) || null };
+  return { win, doc: documentStub, byId: (id) => registry.get(id) || null, makeStorage };
 }
 
 /* ---------- stub MutationObserver (installed lazily, per test, when needed) ---------- */
@@ -1062,6 +1078,174 @@ async function main(){
       '17p-4: weak wording flags a site to double-check');
     ok(RW._dbPrefillStatusText({ recovered: ['a'], missing: ['b'], weak: [] }, true, 2).indexOf('(2 from the previous label)') !== -1,
       '17p-5: remembered wording names the count');
+  }
+
+  /* ===== 18. OCR Box interaction — a hidden-by-boon-ocr flicker must not wipe the builder ===== */
+  {
+    // 18a/18b: RW._ocrBoxDrawing latched true during the hidden window suppresses the reset.
+    let win = seedWin(makeStubWindow().win);
+    const MO = makeMutationObserverStub();
+    win.MutationObserver = MO;
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-field-desc').value = 'Concrete';
+    win.document.getElementById('rw-db-field-desc')._fire('input', {});
+
+    modal.hidden = true; MO._instances[0].trigger();     // boon-ocr's armOcrBoxDraw-style hide
+    RW._ocrBoxDrawing = true;                             // set AFTER the hide, same as the real sequence
+    MO._instances[0].trigger();                           // a mutation firing while still hidden latches it
+    RW._ocrBoxDrawing = false;                            // finishOcrBoxDraw clears it BEFORE restoring display
+    modal.hidden = false; MO._instances[0].trigger();     // the restore
+    ok(win.document.getElementById('rw-db-field-desc').value === 'Concrete',
+      '18a: a hidden->visible flip latched during OCR Box drawing does not wipe a typed field');
+
+    // 18b: the skip is one-shot — a genuine reopen right after still resets normally.
+    modal.hidden = true; MO._instances[0].trigger();
+    modal.hidden = false; MO._instances[0].trigger();
+    ok(win.document.getElementById('rw-db-field-desc').value === '',
+      '18b: the very next hidden->visible transition (no box-drawing flag) resets normally — the skip does not stick');
+  }
+  {
+    // 18c: RW._ocrBoxDrawing never set at all -> existing behavior is completely unaffected.
+    let win = seedWin(makeStubWindow().win);
+    const MO = makeMutationObserverStub();
+    win.MutationObserver = MO;
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-field-top').value = "-12'-0\"";
+    win.document.getElementById('rw-db-field-top')._fire('input', {});
+    modal.hidden = true; MO._instances[0].trigger();
+    modal.hidden = false; MO._instances[0].trigger();
+    ok(win.document.getElementById('rw-db-field-top').value === '',
+      '18c: with boon-ocr absent entirely (RW._ocrBoxDrawing never set), hidden->visible still resets exactly as before');
+  }
+  {
+    // 18d: an Edit modal behaves the same way — the prefill/reprefill also survives an OCR Box flicker.
+    let win = seedWin(makeStubWindow().win);
+    const MO = makeMutationObserverStub();
+    win.MutationObserver = MO;
+    const modal = makeFakeLabelModal(win, { title: 'Edit Label', description: 'Concrete - Wall\nschedule' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-field-thickness').value = '18"'; // a value the description itself never had
+    win.document.getElementById('rw-db-field-thickness')._fire('input', {});
+
+    modal.hidden = true; MO._instances[0].trigger();
+    RW._ocrBoxDrawing = true;
+    MO._instances[0].trigger();
+    RW._ocrBoxDrawing = false;
+    modal.hidden = false; MO._instances[0].trigger();
+    ok(win.document.getElementById('rw-db-field-thickness').value === '18"',
+      '18d: an Edit modal\'s hand-typed field also survives an OCR Box flicker, not just Create\'s blank fields');
+  }
+
+  /* ===== 19. Template persistence — survives a modal reopen and, via localStorage, a reload ===== */
+  {
+    // 19a: a pre-seeded stored value is loaded as RW._dbDefaultTemplate at install, and the
+    // textarea (once built, Advanced mode) reflects it.
+    const s = makeStubWindow();
+    let win = seedWin(s.win);
+    win.MutationObserver = makeMutationObserverStub();
+    win.localStorage.setItem('rwDescTemplate', '{onlyfield}');
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    ok(RW._dbDefaultTemplate === '{onlyfield}', '19a: a seeded stored template becomes the effective default at install');
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    ok(win.document.getElementById('rw-db-template').value === '{onlyfield}', '19a-2: the Advanced template textarea reflects the seeded value');
+    ok(!!win.document.getElementById('rw-db-field-onlyfield'), '19a-3: the generated field row matches the seeded template');
+  }
+  {
+    // 19b: editing the textarea writes the new value into storage under the console-overridable key.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    const templateEl = win.document.getElementById('rw-db-template');
+    templateEl.value = '{custom} field';
+    templateEl._fire('input', {});
+    ok(win.localStorage.getItem(RW._dbTemplateStorageKey) === '{custom} field', '19b: an edit is saved to localStorage under RW._dbTemplateStorageKey');
+    ok(RW._dbDefaultTemplate === '{custom} field', '19b-2: the edit also becomes the new in-memory effective default immediately');
+  }
+  {
+    // 19c: a throwing localStorage (private window / blocked site data) never crashes install,
+    // and the module still works, in-memory only, with the built-in default.
+    const s = makeStubWindow();
+    let win = seedWin(s.win);
+    win.localStorage = s.makeStorage({ throwing: true });
+    win.MutationObserver = makeMutationObserverStub();
+    let threw = false;
+    let RW;
+    try {
+      makeFakeLabelModal(win, { title: 'Create New Label' });
+      RW = loadModule(win);
+    } catch (e) { threw = true; }
+    ok(!threw, '19c: a throwing localStorage does not crash install');
+    ok(RW && RW._dbDefaultTemplate === RW._dbBuiltinDefaultTemplate, '19c-2: falls back to the built-in default when storage is unusable');
+    // Editing the template afterward must not throw either (the save side must degrade the same way).
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    const templateEl = win.document.getElementById('rw-db-template');
+    let threwOnEdit = false;
+    try { templateEl.value = '{x}'; templateEl._fire('input', {}); } catch (e) { threwOnEdit = true; }
+    ok(!threwOnEdit, '19c-3: editing the template with a throwing localStorage does not throw either');
+  }
+  {
+    // 19d: a console override set before this module ever ran wins over a seeded stored value.
+    const s = makeStubWindow();
+    let win = seedWin(s.win);
+    win.localStorage.setItem('rwDescTemplate', '{fromstorage}');
+    win.__RW = { _dbDefaultTemplate: '{fromconsole}' };
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    ok(RW._dbDefaultTemplate === '{fromconsole}', '19d: a pre-set console override wins over a seeded stored value');
+  }
+  {
+    // 19e: the same-session gap this feature closes — editing the template, then closing and
+    // reopening the SAME modal (no reload at all), still shows the edited template, not the
+    // original built-in one RW._dbResetFields used to always stomp it back to.
+    let win = seedWin(makeStubWindow().win);
+    const MO = makeMutationObserverStub();
+    win.MutationObserver = MO;
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    const templateEl = win.document.getElementById('rw-db-template');
+    templateEl.value = '{persisted}';
+    templateEl._fire('input', {});
+
+    modal.hidden = true; MO._instances[0].trigger();
+    modal.hidden = false; MO._instances[0].trigger();
+    ok(win.document.getElementById('rw-db-template').value === '{persisted}',
+      '19e: an edited template survives a same-session modal reopen instead of reverting to the built-in default');
+    ok(!!win.document.getElementById('rw-db-field-persisted'), '19e-2: the field rows still match the edited (not reverted) template');
+  }
+  {
+    // 19f: Reset to default clears storage and restores the exact built-in template.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    const templateEl = win.document.getElementById('rw-db-template');
+    templateEl.value = '{custom}';
+    templateEl._fire('input', {});
+    ok(win.localStorage.getItem(RW._dbTemplateStorageKey) === '{custom}', 'precondition: the custom edit was saved');
+
+    win.document.getElementById('rw-db-template-reset')._fire('click', {});
+    ok(RW._dbDefaultTemplate === RW._dbBuiltinDefaultTemplate, '19f: Reset to default restores RW._dbDefaultTemplate to the exact built-in template');
+    ok(win.document.getElementById('rw-db-template').value === RW._dbBuiltinDefaultTemplate, '19f-2: the textarea reflects the reset immediately');
+    ok(win.localStorage.getItem(RW._dbTemplateStorageKey) === null, '19f-3: the stored value is forgotten, not merely overwritten with the built-in text');
+  }
+  {
+    // 19g: a blank/whitespace-only stored value is treated as nothing saved, not an intentional
+    // blank template that would leave the annotator with no fields at all.
+    const s = makeStubWindow();
+    let win = seedWin(s.win);
+    win.localStorage.setItem('rwDescTemplate', '   ');
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    ok(RW._dbDefaultTemplate === RW._dbBuiltinDefaultTemplate, '19g: a whitespace-only stored value falls back to the built-in default');
   }
 
   console.log((pass + fail) + ' tests, ' + pass + ' passed, ' + fail + ' failed');

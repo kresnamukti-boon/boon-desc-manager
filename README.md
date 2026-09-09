@@ -46,7 +46,8 @@ bash build_loader.sh
 
 Paste again after each page navigation — nothing here persists across a reload, including
 whatever you'd typed into the builder's own fields (the app's own **Save**, on the description
-field it writes into, is unaffected by this, same as always).
+field it writes into, is unaffected by this, same as always) — **except your Advanced template**,
+which is saved automatically and comes back on its own; see "Advanced mode" below.
 
 ## Using the builder
 
@@ -123,6 +124,11 @@ Click **Advanced** in the panel's own header to reveal:
   with an inline message rather than silently doing nothing.
 - Switching back to **Simple** just hides these two — nothing you added is lost, and reopening
   Advanced later shows it again for the rest of the session.
+- **Your edited template is saved automatically** and carries over to your *next* session too —
+  re-paste the loader after a page reload and it's still there, no retyping. (Everything else in
+  this add-on — Simple/Advanced, Remember Values, the collapsed/expanded panel — stays session-only,
+  same as always.) Click **Reset to default** next to the template box to throw away your saved
+  template and go back to the built-in one.
 
 ### Remembering values
 
