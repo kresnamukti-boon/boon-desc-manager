@@ -68,7 +68,10 @@ see "Advanced mode" below.
   push the app's own Cancel/Save row out of view.
 - Each field has a one-click **NS** button that fills it with the literal text `NS` — a description
   line is never silently dropped just because a value is blank, so leaving it empty and clicking
-  Fill would otherwise write a plain empty line; NS makes that visible instead.
+  Fill would otherwise write a plain empty line; NS makes that visible instead. Marking
+  **thickness** or an **elevation** (top/bot) NS also rewords the explanation sentence
+  automatically — "No thickness information found", "No information on TOW" (top) / "TOF" (bot),
+  or both combined — instead of splicing a literal "NS" into the middle of a sentence.
 - Suggested values pop up as you type (`Wall`, `Footing`, `schedule`, ...) — pure suggestions, you
   can always type anything else.
 - **top** / **bot** can be real elevations (`-12'-0"`, `-14'-0"`) or datum names with no numbers at
@@ -77,6 +80,14 @@ see "Advanced mode" below.
   explanation sentence still reads naturally. Either way, an **Override** button lets you type
   whatever you actually want there instead — including a metric value (`600mm`) — this add-on does
   no unit conversion, Override is the deliberate escape hatch for that.
+- **bot** also understands a slab in between: type it as `2" - 0'-5"` (the slab's thickness, then
+  the real TOF elevation) and the span/explanation account for it automatically
+  (`TOW − slab thickness − TOF`) — the measurement line still shows `bot` exactly as typed. This is
+  a *separate* number from **thickness** (which always describes the wall itself) — the two never
+  affect each other, so you can enter a wall thickness and a slab thickness at the same time and
+  each shows up in its own place. Type the bare word `SLAB` (no number) when there's a slab but you
+  don't know its elevation — the explanation says so ("no information on TOF") without touching
+  your wall thickness at all.
 - **Fill Description** writes the preview text into the Description field below it. If that field
   already has text in it, the first click only asks — the button relabels to **Overwrite?** for a
   few seconds — and a second click actually commits, so a stray click can't clobber something

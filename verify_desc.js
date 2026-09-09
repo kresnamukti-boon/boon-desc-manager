@@ -1712,6 +1712,366 @@ async function main(){
     ok(RW._dbOutputOverridden === false, '21i: a successfully-prefilled Edit modal does not auto-engage the override');
   }
 
+  /* ===== 22. Round 8 — smart NS wording in the explanation ===== */
+  {
+    // 22a: RW._dbIsNS
+    const win = seedWin(makeStubWindow().win);
+    const RW = loadModule(win);
+    ok(RW._dbIsNS('NS') === true, '22a: exact "NS"');
+    ok(RW._dbIsNS('ns') === true, '22a-2: lowercase "ns"');
+    ok(RW._dbIsNS(' Ns ') === true, '22a-3: mixed case + surrounding whitespace');
+    ok(RW._dbIsNS('') === false, '22a-4: blank is not NS');
+    ok(RW._dbIsNS('18"') === false, '22a-5: a real value is not NS');
+    ok(RW._dbIsNS('Not Shown') === false, '22a-6: a different phrase is not NS — only the literal marker counts');
+    ok(RW._dbIsNS(null) === false, '22a-7: null is not NS');
+  }
+  {
+    // 22b: RW._dbFindNsExplanationLine — structural detection, not literal-text matching
+    const win = seedWin(makeStubWindow().win);
+    const RW = loadModule(win);
+    ok(RW._dbFindNsExplanationLine(RW._dbDefaultTemplate) === 4,
+      '22b: the built-in default template\'s explanation line is found at index 4');
+    ok(RW._dbFindNsExplanationLine('{thickness} {span} {source}') === -1,
+      '22b-2: a line missing {where} never matches — no false positive');
+    ok(RW._dbFindNsExplanationLine('{desc}\nnote: {span} and {where} and {source} and {thickness}, reworded') === 1,
+      '22b-3: reordering/rewording the surrounding literal text still finds it structurally');
+    ok(RW._dbFindNsExplanationLine('') === -1, '22b-4: an empty template never matches');
+    ok(RW._dbFindNsExplanationLine(null) === -1, '22b-5: a null template never throws, never matches');
+  }
+  {
+    // 22c: RW._dbNsExplanationText — the exact decision table, confirmed with the user
+    const win = seedWin(makeStubWindow().win);
+    const RW = loadModule(win);
+    const sample = {
+      desc: 'Concrete', keyword: 'Wall', source: 'schedule', word: 'height',
+      top: "-12'-0\"", bot: "-14'-0\"", thickness: '18"', where: 'the plan and notes',
+    };
+    sample.span = RW._dbSpan(sample.top, sample.bot, '').value;
+
+    ok(RW._dbNsExplanationText(sample) === null, '22c: neither NS -> null, caller keeps the normal render');
+
+    const thicknessNS = Object.assign({}, sample, { thickness: 'NS' });
+    ok(RW._dbNsExplanationText(thicknessNS) ===
+      'The detail shows a concrete wall with the height of 2\'-0". No thickness information found. the height can be found in the plan and notes',
+      '22c-2: thickness NS only — exact approved wording');
+
+    const topNS = Object.assign({}, sample, { top: 'NS' });
+    ok(RW._dbNsExplanationText(topNS) ===
+      'The detail shows an 18" concrete wall. No information on TOW; the thickness can be found in schedule table within the same page.',
+      '22c-3: top (TOW) NS only — exact approved wording');
+
+    const botNS = Object.assign({}, sample, { bot: 'NS' });
+    ok(RW._dbNsExplanationText(botNS) ===
+      'The detail shows an 18" concrete wall. No information on TOF; the thickness can be found in schedule table within the same page.',
+      '22c-4: bot (TOF) NS only — exact approved wording');
+
+    const bothSidesNS = Object.assign({}, sample, { top: 'NS', bot: 'NS' });
+    ok(RW._dbNsExplanationText(bothSidesNS) ===
+      'The detail shows an 18" concrete wall. No information on TOW and TOF; the thickness can be found in schedule table within the same page.',
+      '22c-5: both top AND bot NS — "TOW and TOF"');
+
+    const combinedNS = Object.assign({}, sample, { thickness: 'NS', top: 'NS' });
+    ok(RW._dbNsExplanationText(combinedNS) === 'No thickness information found and no information on TOW.',
+      '22c-6: thickness AND elevation both NS — the combined, whole-explanation wording');
+
+    const combinedBothSides = Object.assign({}, sample, { thickness: 'NS', top: 'NS', bot: 'NS' });
+    ok(RW._dbNsExplanationText(combinedBothSides) === 'No thickness information found and no information on TOW and TOF.',
+      '22c-7: thickness NS plus BOTH elevation sides NS combines correctly too');
+  }
+  {
+    // 22d: RW._dbApplyNsExplanation — the splice, no-ops, and prefix preservation
+    const win = seedWin(makeStubWindow().win);
+    const RW = loadModule(win);
+    const sample = {
+      desc: 'Concrete', keyword: 'Wall', source: 'schedule', word: 'height',
+      top: "-12'-0\"", bot: "-14'-0\"", thickness: '18"', where: 'the plan and notes',
+    };
+    sample.span = RW._dbSpan(sample.top, sample.bot, '').value;
+    const normalRendered = RW._dbRender(RW._dbDefaultTemplate, sample);
+
+    ok(RW._dbApplyNsExplanation(normalRendered, RW._dbDefaultTemplate, sample) === normalRendered,
+      '22d: neither NS -> byte-identical no-op (re-confirms the headline sample is unaffected)');
+
+    ok(RW._dbApplyNsExplanation('irrelevant', '{thickness} {span} {source}', sample) === 'irrelevant',
+      '22d-2: no matching line in the template -> no-op');
+
+    const nsValues = Object.assign({}, sample, { thickness: 'NS' });
+    const nsRendered = RW._dbRender(RW._dbDefaultTemplate, nsValues);
+    const spliced = RW._dbApplyNsExplanation(nsRendered, RW._dbDefaultTemplate, nsValues);
+    const lines = spliced.split('\n');
+    ok(lines.length === 5, '22d-3: line count is unchanged — one template line still renders to one line');
+    ok(lines[0] === 'Concrete - Wall' && lines[1] === 'schedule' && lines[2] === 'height: [-12\'-0"] - [-14\'-0"]'
+      && lines[3] === 'thickness: NS', '22d-4: every OTHER line is left completely untouched');
+    ok(lines[4] === 'explanation: The detail shows a concrete wall with the height of 2\'-0". '
+      + 'No thickness information found. the height can be found in the plan and notes',
+      '22d-5: the explanation line is spliced with its "explanation: " prefix preserved — got ' + lines[4]);
+  }
+  {
+    // 22e: the DOM/UI seam — RW._dbRunPreview and RW._dbRunFill both show the NS wording, via the
+    // one shared RW._dbComputeOutput (so Fill writes exactly what the preview showed).
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    const set = (name, val) => {
+      const el = win.document.getElementById('rw-db-field-' + name);
+      el.value = val; el._fire('input', {});
+    };
+    set('desc', 'Concrete'); set('keyword', 'Wall'); set('source', 'schedule');
+    set('word', 'height'); set('top', "-12'-0\""); set('bot', "-14'-0\"");
+    set('thickness', 'NS'); set('where', 'the plan and notes');
+
+    const preview = win.document.getElementById('rw-db-preview').innerText;
+    ok(preview.indexOf('No thickness information found.') !== -1,
+      '22e: the live preview shows the NS wording — got:\n' + preview);
+    ok(preview === RW._dbComputeOutput(), '22e-2: the preview matches RW._dbComputeOutput exactly');
+
+    win.document.getElementById('rw-db-fill')._fire('click', {}); // empty textarea, no confirm needed
+    const descInp = modal.querySelector('#label-description');
+    ok(descInp.value === preview, '22e-3: Fill writes exactly what the preview showed');
+  }
+  {
+    // 22f: regression guard — an ORDINARY (non-NS) description still recovers {where}/{source}
+    // exactly, the round-4 guarantee this whole design was built specifically to protect.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    const helperWin = seedWin(makeStubWindow().win);
+    const RWHelper = loadModule(helperWin);
+    const sample = {
+      desc: 'Concrete', keyword: 'Wall', source: 'schedule', word: 'height',
+      top: "-12'-0\"", bot: "-14'-0\"", thickness: '18"', where: 'the plan and notes',
+    };
+    sample.span = RWHelper._dbSpan(sample.top, sample.bot, '').value;
+    const rendered = RWHelper._dbRender(RWHelper._dbDefaultTemplate, sample);
+    makeFakeLabelModal(win, { title: 'Edit Label', description: rendered });
+    const RW = loadModule(win);
+    ok(win.document.getElementById('rw-db-field-where').value === 'the plan and notes',
+      '22f: {where} still recovers exactly on an ordinary (non-NS) Edit — the guarantee this design protects');
+    ok(win.document.getElementById('rw-db-field-source').value === 'schedule',
+      '22f-2: {source} recovers too');
+    ok(win.document.getElementById('rw-db-prefill-status').innerText.indexOf('preview matches it exactly') !== -1,
+      '22f-3: the exact byte-for-byte prefill signal is unaffected');
+  }
+  {
+    // 22g: reopening a label whose description WAS produced under an NS condition never crashes —
+    // it degrades gracefully (that one line just doesn't re-match), same class as any hand-edited
+    // sentence already does today.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    const helperWin = seedWin(makeStubWindow().win);
+    const RWHelper = loadModule(helperWin);
+    const nsValues = {
+      desc: 'Concrete', keyword: 'Wall', source: 'schedule', word: 'height',
+      top: "-12'-0\"", bot: "-14'-0\"", thickness: 'NS', where: 'the plan and notes',
+    };
+    nsValues.span = RWHelper._dbSpan(nsValues.top, nsValues.bot, '').value;
+    const nsRendered = RWHelper._dbRender(RWHelper._dbDefaultTemplate, nsValues);
+    const nsFinal = RWHelper._dbApplyNsExplanation(nsRendered, RWHelper._dbDefaultTemplate, nsValues);
+    let threw = false;
+    try { makeFakeLabelModal(win, { title: 'Edit Label', description: nsFinal }); loadModule(win); }
+    catch (e) { threw = true; }
+    ok(!threw, '22g: reopening a label produced under an NS condition never crashes the panel');
+    ok(win.document.getElementById('rw-db-field-thickness').value === 'NS',
+      '22g-2: the earlier lines (thickness: NS) still recover fine — only the explanation line is affected');
+  }
+
+  /* ===== 23. Round 9 — a SLAB thickness embedded in `bot`, kept independent of the WALL's own
+     {thickness} field ===== */
+  //
+  // A real design bug caught by the user before this round ever reached a live page: the first
+  // draft auto-filled and read-only-locked {thickness} from bot's detected value — but {thickness}
+  // is the WALL's own thickness (used in "thickness: {thickness}" and the explanation's own
+  // "{a} {thickness} {desc:lower} ..."), a completely different physical quantity from whatever
+  // slab sits between the wall and the footing. Fixed by never touching {thickness} at all: the
+  // detected slab thickness feeds ONLY the span/height-depth arithmetic below.
+  {
+    // 23a: RW._dbParseBotThickness
+    const win = seedWin(makeStubWindow().win);
+    const RW = loadModule(win);
+    ok(JSON.stringify(RW._dbParseBotThickness('2" - 0\'-5"')) === JSON.stringify({ slabThickness: '2"', elevation: "0'-5\"" }),
+      '23a: a valid compound value splits into slabThickness + elevation');
+    ok(JSON.stringify(RW._dbParseBotThickness('SLAB')) === JSON.stringify({ slabThickness: 'NS', elevation: 'NS' }),
+      '23a-2: bare "SLAB" -> both pieces unknown ("NS")');
+    ok(JSON.stringify(RW._dbParseBotThickness(' slab ')) === JSON.stringify({ slabThickness: 'NS', elevation: 'NS' }),
+      '23a-3: case-insensitive / trimmed, matching RW._dbIsNS\'s own style');
+    ok(RW._dbParseBotThickness("-14'-0\"") === null, '23a-4: a plain elevation is not compound');
+    ok(RW._dbParseBotThickness('T/FOOTING') === null, '23a-5: a datum name is not compound');
+    ok(RW._dbParseBotThickness('NS') === null, '23a-6: plain "NS" (not "SLAB") is unaffected — round 8\'s own case, untouched');
+    ok(RW._dbParseBotThickness('') === null, '23a-7: blank is not compound');
+    ok(RW._dbParseBotThickness(null) === null, '23a-8: null never throws');
+    ok(RW._dbParseBotThickness('2" - garbage') === null, '23a-9: a malformed compound (one side unparseable) falls through, not compound');
+    ok(RW._dbParseBotThickness('garbage - 0\'-5"') === null, '23a-10: same, the OTHER side unparseable');
+  }
+  {
+    // 23b: RW._dbComputeSpanWithThickness
+    const win = seedWin(makeStubWindow().win);
+    const RW = loadModule(win);
+    const withThickness = RW._dbComputeSpanWithThickness("-12'-0\"", '2" - 0\'-5"', '');
+    ok(withThickness.value === "12'-3\"" && withThickness.source === 'computed-thickness',
+      '23b: TOW(144) - slab thickness(2") - TOF(5) = 137 -> ' + JSON.stringify(withThickness));
+
+    const bareSlab = RW._dbComputeSpanWithThickness("-12'-0\"", 'SLAB', '');
+    ok(bareSlab.source !== 'computed-thickness' && bareSlab.value.indexOf('NS') !== -1,
+      '23b-2: bare SLAB (slab thickness itself unknown) -> no subtraction attempted, falls back to RW._dbSpan\'s own datum handling');
+
+    const ordinary = RW._dbComputeSpanWithThickness("-12'-0\"", "-14'-0\"", '');
+    const plain = RW._dbSpan("-12'-0\"", "-14'-0\"", '');
+    ok(JSON.stringify(ordinary) === JSON.stringify(plain),
+      '23b-3: an ordinary bot value is byte-identical to calling RW._dbSpan directly — regression guard');
+
+    const overridden = RW._dbComputeSpanWithThickness("-12'-0\"", '2" - 0\'-5"', '600mm');
+    ok(overridden.value === '600mm' && overridden.source === 'override',
+      '23b-4: an explicit span Override still wins over everything, even a compound bot');
+
+    const nonComputedTop = RW._dbComputeSpanWithThickness('T/WALL', '2" - 0\'-5"', '');
+    ok(nonComputedTop.source !== 'computed-thickness',
+      '23b-5: a non-parseable top means nothing to subtract from — no subtraction attempted');
+  }
+  {
+    // 23c: the independence guard — {thickness} (the WALL's own thickness) is NEVER touched by
+    // bot, in either direction, no matter what bot contains.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    const bot = win.document.getElementById('rw-db-field-bot');
+    const thickness = win.document.getElementById('rw-db-field-thickness');
+    const nsBtn = win.document.getElementById('rw-db-ns-thickness');
+
+    thickness.value = '12"'; // the WALL's own thickness, typed independently
+    thickness._fire('input', {});
+    bot.value = '2" - 0\'-5"'; // a DIFFERENT number — the slab's thickness
+    bot._fire('input', {});
+    ok(thickness.value === '12"', '23c: a compound bot never overwrites the separately-typed {thickness}');
+    ok(!thickness.readOnly, '23c-2: {thickness} is never made read-only by bot');
+    ok(!nsBtn.disabled, '23c-3: its NS button is never disabled either');
+    ok(thickness.title === '', '23c-4: no title/tooltip is imposed on it');
+
+    bot.value = 'SLAB';
+    bot._fire('input', {});
+    ok(thickness.value === '12"', '23c-5: bare SLAB doesn\'t touch {thickness} either');
+  }
+  {
+    // 23d: bare SLAB only affects the ELEVATION side of round 8's wording (no information on TOF)
+    // — it does NOT imply anything about the wall's own thickness, which stays whatever was typed
+    // (or blank) and renders completely normally in the same sentence.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    const set = (name, val) => {
+      const el = win.document.getElementById('rw-db-field-' + name);
+      el.value = val; el._fire('input', {});
+    };
+    set('desc', 'Concrete'); set('keyword', 'Wall'); set('source', 'schedule');
+    set('word', 'height'); set('top', "-12'-0\""); set('where', 'the plan and notes');
+    set('thickness', '12"'); // the wall's real thickness, known
+    set('bot', 'SLAB');
+
+    const preview = win.document.getElementById('rw-db-preview').innerText;
+    ok(preview.indexOf('No information on TOF;') !== -1,
+      '23d: bare SLAB triggers only the elevation-NS wording — got:\n' + preview);
+    ok(preview.indexOf('a 12" concrete wall') !== -1,
+      '23d-2: the wall\'s own (known) thickness still renders normally in the same sentence');
+    ok(preview.indexOf('No thickness information found') === -1,
+      '23d-3: the thickness-NS wording is NOT triggered — the wall\'s thickness was never marked NS');
+  }
+  {
+    // 23d-4: the combined wording still works when BOTH are genuinely unknown — but now that
+    // requires the annotator to mark the wall's thickness NS independently (its own NS button),
+    // not something bot implies on its own.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    const set = (name, val) => {
+      const el = win.document.getElementById('rw-db-field-' + name);
+      el.value = val; el._fire('input', {});
+    };
+    set('desc', 'Concrete'); set('keyword', 'Wall'); set('source', 'schedule');
+    set('word', 'height'); set('top', "-12'-0\""); set('where', 'the plan and notes');
+    set('bot', 'SLAB');
+    win.document.getElementById('rw-db-ns-thickness')._fire('click', {}); // the wall's OWN NS button
+
+    const preview = win.document.getElementById('rw-db-preview').innerText;
+    ok(preview.indexOf('No thickness information found and no information on TOF.') !== -1,
+      '23d-4: both marked unknown (independently) still combines correctly — got:\n' + preview);
+  }
+  {
+    // 23e: the full DOM/UI seam with a real slab thickness AND a different, independent wall
+    // thickness — preview and Fill agree exactly, and the two numbers never cross-contaminate.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    const set = (name, val) => {
+      const el = win.document.getElementById('rw-db-field-' + name);
+      el.value = val; el._fire('input', {});
+    };
+    set('desc', 'Concrete'); set('keyword', 'Wall'); set('source', 'schedule');
+    set('word', 'height'); set('top', "-12'-0\""); set('where', 'the plan and notes');
+    set('thickness', '12"'); // the wall's own thickness
+    set('bot', '2" - 0\'-5"'); // the slab's thickness — a different number
+
+    const preview = win.document.getElementById('rw-db-preview').innerText;
+    // No brackets around bot's compound text — :brk only brackets a value that parses as a
+    // NEGATIVE feet-inches elevation, and this compound string doesn't parse as feet-inches at all
+    // (same as any datum name), so it renders bare, exactly as typed.
+    ok(preview.indexOf('height: [-12\'-0"] - 2" - 0\'-5"') !== -1,
+      '23e: the measurement line shows bot raw, exactly as typed (no brackets) — got:\n' + preview);
+    ok(preview.indexOf("with the height of 12'-3\"") !== -1,
+      '23e-2: the explanation uses the SLAB-thickness-adjusted span (12\'-3") — got:\n' + preview);
+    ok(preview.indexOf('a 12" concrete wall') !== -1,
+      '23e-3: ...while still describing the wall by its OWN thickness (12"), not the slab\'s (2") — got:\n' + preview);
+    ok(preview.indexOf('thickness: 12"') !== -1, '23e-4: the thickness line shows the wall\'s own value');
+    ok(preview === RW._dbComputeOutput(), '23e-5: the preview matches RW._dbComputeOutput exactly');
+
+    win.document.getElementById('rw-db-fill')._fire('click', {});
+    const descInp = modal.querySelector('#label-description');
+    ok(descInp.value === preview, '23e-6: Fill writes exactly what the preview showed');
+  }
+  {
+    // 23f: reopening a label whose description used this format recovers both thicknesses
+    // correctly and independently, and the override-detection comparison correctly does NOT flag
+    // a false "span overridden".
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    const helperWin = seedWin(makeStubWindow().win);
+    const RWHelper = loadModule(helperWin);
+    const values = {
+      desc: 'Concrete', keyword: 'Wall', source: 'schedule', word: 'height',
+      top: "-12'-0\"", bot: '2" - 0\'-5"', thickness: '12"', where: 'the plan and notes',
+    };
+    values.span = RWHelper._dbComputeSpanWithThickness(values.top, values.bot, '').value;
+    const rendered = RWHelper._dbRender(RWHelper._dbDefaultTemplate, values);
+    const final = RWHelper._dbApplyNsExplanation(rendered, RWHelper._dbDefaultTemplate, values);
+    makeFakeLabelModal(win, { title: 'Edit Label', description: final });
+    const RW = loadModule(win);
+    ok(win.document.getElementById('rw-db-field-bot').value === '2" - 0\'-5"',
+      '23f: bot recovers its raw compound text verbatim on reopen');
+    ok(win.document.getElementById('rw-db-field-thickness').value === '12"',
+      '23f-2: {thickness} independently recovers the WALL\'s own value from its own line, unaffected by the slab\'s 2"');
+    ok(!win.document.getElementById('rw-db-field-thickness').readOnly,
+      '23f-3: {thickness} is fully editable again after reopening — never locked');
+    ok(RW._dbSpanOverridden === false,
+      '23f-4: NOT falsely flagged as a manual span override — the regression this round specifically guards against');
+    ok(win.document.getElementById('rw-db-prefill-status').innerText.indexOf('preview matches it exactly') !== -1,
+      '23f-5: the byte-for-byte prefill signal holds for a slab-thickness-adjusted description too');
+  }
+  {
+    // 23g: regression guard — an ORDINARY (non-compound) bot never triggers any of this.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    const thickness = win.document.getElementById('rw-db-field-thickness');
+    const bot = win.document.getElementById('rw-db-field-bot');
+    bot.value = "-14'-0\"";
+    bot._fire('input', {});
+    ok(!thickness.readOnly, '23g: an ordinary bot value never read-onlies {thickness}');
+    ok(thickness.value === '', '23g-2: {thickness} is never auto-filled from an ordinary bot value');
+  }
+
   console.log((pass + fail) + ' tests, ' + pass + ' passed, ' + fail + ' failed');
   process.exit(fail ? 1 : 0);
 }

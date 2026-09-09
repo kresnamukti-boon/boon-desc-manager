@@ -145,6 +145,57 @@
     return { value: '', source: '' };
   };
 
+  /* ---------- round 9: a slab thickness embedded in `bot` itself ----------
+     In some conditions the true height/depth isn't a plain TOW - TOF (top - bot) — there's a slab
+     of a given thickness sitting in between, so the real figure is TOW - slab thickness - TOF.
+     Rather than a separate field or a keyword-based toggle, this is auto-detected from `bot`'s own
+     raw text: `2" - 0'-5"` means "a 2\" slab, with the true TOF at 0'-5\""; the bare word `SLAB`
+     (no number at all) means "there's a slab here, but its thickness isn't known" — both pieces
+     unknown. This is a SEPARATE quantity from {thickness} (the wall's own thickness, used in the
+     "thickness: {thickness}" line and the explanation's "{a} {thickness} {desc:lower} ..." — a
+     completely different physical value describing the wall itself, not whatever slab sits
+     between it and the footing). The detected slab thickness feeds ONLY the span/height-depth
+     arithmetic below — it never reads from or writes to {thickness}, which stays exactly what the
+     annotator types, independent of this. */
+
+  // Detects bot's two special shapes; returns null for everything else (a plain elevation, datum
+  // name, NS, blank) — completely unaffected, matching today's behavior exactly. The compound
+  // split looks for a literal " - " (space-hyphen-space); a bare negative sign like -14'-0" has no
+  // such pattern, so this never collides with a normal negative elevation. Both halves must parse
+  // via RW._dbParseFtIn, or this returns null (not compound — the safe fallback for anything
+  // malformed or ambiguous). Values are returned exactly as typed, never reformatted.
+  RW._dbParseBotThickness = function(botRaw){
+    const raw = String(botRaw == null ? '' : botRaw).trim();
+    if (!raw) return null;
+    if (raw.toUpperCase() === 'SLAB') return { slabThickness: 'NS', elevation: 'NS' };
+    const sepIdx = raw.indexOf(' - ');
+    if (sepIdx === -1) return null;
+    const thicknessPart = raw.slice(0, sepIdx).trim();
+    const elevationPart = raw.slice(sepIdx + 3).trim();
+    if (RW._dbParseFtIn(thicknessPart) == null || RW._dbParseFtIn(elevationPart) == null) return null;
+    return { slabThickness: thicknessPart, elevation: elevationPart };
+  };
+
+  // Wraps RW._dbSpan to additionally subtract a SLAB thickness detected inside `bot` (above) — not
+  // {thickness}, which is the wall's own thickness and plays no part in this arithmetic. Returns
+  // the same { value, source } shape RW._dbSpan does (a new 'computed-thickness' source when the
+  // subtraction actually applied, for a more specific span-row tooltip). An explicit Override
+  // still always wins (checked first, matching RW._dbSpan's own precedence). The subtraction only
+  // applies when RW._dbSpan actually computed a real number (both `top` and the extracted
+  // elevation parsed as feet-inches) — a datum-name/partial/blank result is left alone, since
+  // there's nothing numeric to subtract from; and only when the detected slab thickness itself is
+  // known (not the bare-SLAB "NS" case, where there's nothing to subtract either).
+  RW._dbComputeSpanWithThickness = function(top, bot, override){
+    const botInfo = RW._dbParseBotThickness(bot);
+    const effectiveBot = botInfo ? botInfo.elevation : bot;
+    const result = RW._dbSpan(top, effectiveBot, override);
+    if (override || !botInfo || result.source !== 'computed' || RW._dbIsNS(botInfo.slabThickness)) return result;
+    const spanIn = RW._dbParseFtIn(result.value);
+    const thickIn = RW._dbParseFtIn(botInfo.slabThickness);
+    if (spanIn == null || thickIn == null) return result;
+    return { value: RW._dbFormatFtIn(Math.abs(spanIn - thickIn)), source: 'computed-thickness' };
+  };
+
   /* ---------- template engine ---------- */
 
   // Names the template engine computes itself and which must never become an auto-generated
@@ -289,6 +340,105 @@
   // no height/depth line at all needs neither).
   RW._dbTemplateUsesSpan = function(text){
     return /\{span(?::[A-Za-z]+)?\}/.test(String(text == null ? '' : text));
+  };
+
+  /* ---------- smart NS wording in the explanation (round 8) ----------
+     If thickness (or the elevation — top=TOW, bot=TOF) is marked NS, the literal string "NS"
+     spliced into the explanation sentence reads badly ("with the height of NS") and, worse, an
+     NS top/bot makes RW._dbSpan produce a nonsense join like "NS to -14'-0\"". This substitutes
+     natural wording instead — but as a POST-RENDER text substitution inside RW._dbComputeOutput,
+     never by changing the template text itself. A tempting alternative — a new derived
+     {explanation} placeholder computed like {span} already is — was rejected: it would silently
+     break the reverse parser's ability to recover {where} (which has no other occurrence in the
+     template) on EVERY future re-edit, not just the NS ones, since RW._dbParseDescription matches
+     the TEMPLATE's structure, not rendered text. Leaving the template untouched means the common
+     (no-NS) case is a full no-op — byte-identical to today — and only a description that WAS
+     produced under an NS condition fails to re-match this one line on a later reopen, no worse
+     than any hand-edited sentence already does. */
+
+  // Case-insensitive, trimmed — matches what the NS button writes but tolerates a hand-typed
+  // "ns". A blank field (never touched) is NOT NS and never triggers this.
+  RW._dbIsNS = function(v){
+    return String(v == null ? '' : v).trim().toUpperCase() === 'NS';
+  };
+
+  // Finds the template line (by index) whose tokens mention thickness, span, source, AND where
+  // together — the built-in explanation line's structural signature. Purely STRUCTURAL (which
+  // names appear on one line), never literal wording, so it still finds the line after the
+  // annotator rewords the surrounding sentence, and simply doesn't fire (-1) on a custom template
+  // that doesn't have this shape — a safe no-op, not a forced behavior on every template.
+  RW._dbFindNsExplanationLine = function(templateText){
+    let lines;
+    try { lines = RW._dbTokenizeTemplate(templateText); }
+    catch (e){ return -1; }
+    const required = ['thickness', 'span', 'source', 'where'];
+    for (let i = 0; i < lines.length; i++){
+      const names = new Set(lines[i].filter((t) => t.type === 'var').map((t) => t.name));
+      if (required.every((n) => names.has(n))) return i;
+    }
+    return -1;
+  };
+
+  // The decision table: unchanged when neither is NS (returns null — caller keeps the normal
+  // render); each NS combination gets its own fixed wording, confirmed with the user against the
+  // sample values byte-for-byte. {a} is resolved (RW._dbArticleFor) against whatever word it now
+  // precedes in each variant, exactly as the template's own {a} would.
+  RW._dbNsExplanationText = function(values){
+    values = values || {};
+    const thickness = values.thickness == null ? '' : String(values.thickness);
+    const desc = values.desc == null ? '' : String(values.desc);
+    const keyword = values.keyword == null ? '' : String(values.keyword);
+    const word = values.word == null ? '' : String(values.word);
+    const span = values.span == null ? '' : String(values.span);
+    const source = values.source == null ? '' : String(values.source);
+    const where = values.where == null ? '' : String(values.where);
+
+    const thicknessNS = RW._dbIsNS(thickness);
+    const topNS = RW._dbIsNS(values.top);
+    const botNS = RW._dbIsNS(values.bot);
+    const elevationNS = topNS || botNS;
+    if (!thicknessNS && !elevationNS) return null;
+
+    const descLower = RW._dbApplyModifier(desc, 'lower');
+    const keywordLower = RW._dbApplyModifier(keyword, 'lower');
+    const datum = (topNS && botNS) ? 'TOW and TOF' : (topNS ? 'TOW' : 'TOF');
+
+    if (thicknessNS && elevationNS){
+      return 'No thickness information found and no information on ' + datum + '.';
+    }
+    if (thicknessNS){
+      const a = RW._dbArticleFor(descLower);
+      return 'The detail shows ' + a + ' ' + descLower + ' ' + keywordLower + ' with the ' + word
+        + ' of ' + span + '. No thickness information found. the ' + word + ' can be found in ' + where;
+    }
+    // elevationNS only
+    const a = RW._dbArticleFor(thickness);
+    return 'The detail shows ' + a + ' ' + thickness + ' ' + descLower + ' ' + keywordLower
+      + '. No information on ' + datum + '; the thickness can be found in ' + source + ' table within the same page.';
+  };
+
+  // Splices RW._dbNsExplanationText's override into the ALREADY-RENDERED text at the line
+  // RW._dbFindNsExplanationLine identifies, preserving that line's own leading "label: " prefix —
+  // extracted from its first literal token via /^([^:]*:\s*)/, so a renamed label ("note: " etc.)
+  // still works without hardcoding "explanation: ". A no-op (returns renderedText unchanged) when
+  // no matching line is found, or when neither NS condition applies.
+  RW._dbApplyNsExplanation = function(renderedText, templateText, values){
+    const idx = RW._dbFindNsExplanationLine(templateText);
+    if (idx < 0) return renderedText;
+    const override = RW._dbNsExplanationText(values);
+    if (override == null) return renderedText;
+
+    let tLines;
+    try { tLines = RW._dbTokenizeTemplate(templateText); }
+    catch (e){ return renderedText; }
+    const first = (tLines[idx] || [])[0];
+    const labelMatch = (first && first.type === 'literal') ? /^([^:]*:\s*)/.exec(first.text) : null;
+    const prefix = labelMatch ? labelMatch[1] : '';
+
+    const lines = renderedText.split('\n');
+    if (idx >= lines.length) return renderedText;
+    lines[idx] = prefix + override;
+    return lines.join('\n');
   };
 
   /* ---------- reverse parser: recovers field values from an already-rendered description ---------- */
@@ -588,7 +738,10 @@
     let span = null;
     const bestSpan = bestOf(spanCands);
     if (bestSpan && bestSpan.value){
-      const computed = RW._dbSpan(values.top || '', values.bot || '', '').value;
+      // Round 9: RW._dbComputeSpanWithThickness here, not plain RW._dbSpan — otherwise a
+      // description that legitimately used a bot-embedded slab thickness would recompute the
+      // WRONG (un-subtracted) figure and get falsely flagged as a manual span override.
+      const computed = RW._dbComputeSpanWithThickness(values.top || '', values.bot || '', '').value;
       span = { text: bestSpan.value, computed: computed, overridden: bestSpan.value !== computed };
     }
 
@@ -872,9 +1025,16 @@
     const { templateText, values } = RW._dbCollectValues();
     if (RW._dbTemplateUsesSpan(templateText)){
       const overrideVal = RW._dbSpanOverridden ? (RW._dbSpanOverrideValue || '') : '';
-      values.span = RW._dbSpan(values.top || '', values.bot || '', overrideVal).value;
+      values.span = RW._dbComputeSpanWithThickness(values.top || '', values.bot || '', overrideVal).value; // round 9
     }
-    return RW._dbRender(templateText, values);
+    const rendered = RW._dbRender(templateText, values);
+    // Round 9: the NS-explanation check (round 8) needs to see bot's EXTRACTED elevation, not its
+    // raw compound/bare-SLAB text — a bare "SLAB" bot has no elevation given either, so it must
+    // read as NS there too (RW._dbParseBotThickness already returns 'NS' for that shape); a
+    // compound bot's real extracted elevation (e.g. "0'-5\"") correctly stays "known".
+    const botInfo = RW._dbParseBotThickness(values.bot);
+    const nsValues = botInfo ? Object.assign({}, values, { bot: botInfo.elevation }) : values;
+    return RW._dbApplyNsExplanation(rendered, templateText, nsValues); // round 8 — smart NS wording
   };
 
   RW._dbRunPreview = function(){
@@ -985,6 +1145,7 @@
 
   const SPAN_TITLES = {
     computed: 'computed from top − bot',
+    'computed-thickness': 'computed from top − thickness − bot (a slab thickness detected inside bot)',
     datum: 'from datums (top to bot) — not both feet-inches',
     partial: 'only one of top/bot given',
     '': 'nothing to compute yet',
@@ -1015,7 +1176,7 @@
     }
 
     const { values } = RW._dbCollectValues();
-    const span = RW._dbSpan(values.top || '', values.bot || '', '');
+    const span = RW._dbComputeSpanWithThickness(values.top || '', values.bot || '', '');
     const display = mkEl('span', { id: 'rw-db-span-display', innerText: span.value || '(blank)', title: SPAN_TITLES[span.source] || '' },
       'flex:1;');
     row.appendChild(display);
@@ -1199,10 +1360,19 @@
       catch (e){ continue; }
       if (!result.matchedLines) continue;
 
-      const span = result.span ? result.span.text : RW._dbSpan(result.values.top || '', result.values.bot || '', '').value;
+      // Round 9: RW._dbComputeSpanWithThickness in the fallback (no span text recovered at all),
+      // so a description using a bot-embedded slab thickness still reconstructs correctly.
+      const span = result.span ? result.span.text : RW._dbComputeSpanWithThickness(result.values.top || '', result.values.bot || '', '').value;
       const values = Object.assign({}, result.values, { span: span });
+      // Same substitution RW._dbComputeOutput applies — the NS-explanation check needs bot's
+      // EXTRACTED elevation, not its raw compound/bare-SLAB text (see there for why).
+      const botInfo = RW._dbParseBotThickness(values.bot);
+      const nsValues = botInfo ? Object.assign({}, values, { bot: botInfo.elevation }) : values;
       let rendered;
-      try { rendered = RW._dbRender(entry.text, values); }
+      try {
+        rendered = RW._dbRender(entry.text, values);
+        rendered = RW._dbApplyNsExplanation(rendered, entry.text, nsValues); // round 8 — was missing here
+      }
       catch (e){ rendered = null; }
 
       const cand = { name: entry.name, result: result, exact: rendered === desc };

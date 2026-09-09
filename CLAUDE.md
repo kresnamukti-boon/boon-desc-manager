@@ -30,7 +30,7 @@ synthetic harness `verify_desc.js` is the whole verification story.
 ```bash
 bash build_loader.sh          # rebuilds desc_loader.js (runs node --check on the result)
 node --check rw_descbuilder.js
-node verify_desc.js           # synthetic harness — 311 tests, all passing
+node verify_desc.js           # synthetic harness — 380 tests, all passing
 ```
 
 To actually verify a change works, it has to be pasted into a real annotation-job page in Chrome
@@ -805,6 +805,196 @@ Spot-checked: reverted to round 6's length-gated version and confirmed exactly `
 visibility test, rewritten this round to assert "shown" instead of "hidden" for the one-template
 case) failed, nothing else — restored. `node --check` passes; `desc_loader.js` rebuilt clean
 (88321 bytes) and reconfirmed free of any control byte.
+
+## Round 8 — smart NS wording in the explanation
+
+Requested directly: when `thickness` (or the elevation — `top`=TOW, `bot`=TOF, per the user's own
+note that the calc is "usually TOW − TOF") is marked **NS**, the literal string "NS" spliced into
+the explanation sentence read badly ("with the height of NS", "a NS concrete wall"), and worse, an
+NS `top`/`bot` made `RW._dbSpan` produce a nonsense datum join like `"NS to -14'-0\""`. Confirmed
+with the user across two rounds of clarifying questions, the exact decision table:
+
+| thickness | elevation (top/bot) | explanation |
+|---|---|---|
+| known | known | unchanged — today's exact wording, byte-for-byte |
+| **NS** | known | `The detail shows {a} {desc:lower} {keyword:lower} with the {word} of {span}. No thickness information found. the {word} can be found in {where}` |
+| known | **NS** | `The detail shows {a} {thickness} {desc:lower} {keyword:lower}. No information on {datum}; the thickness can be found in {source} table within the same page.` |
+| **NS** | **NS** | `No thickness information found and no information on {datum}.` |
+
+`{datum}` is `TOW` (only `top` NS), `TOF` (only `bot` NS), or `TOW and TOF` (both). `RW._dbIsNS`
+detects the marker case-insensitively/trimmed — tolerant of a hand-typed `ns`, but a merely blank
+field is **not** NS and never triggers this. The user also floated a general "conditional
+settings" system in Advanced but explicitly deferred it ("skip this, but put for planning in the
+future") — this round ships only the fixed, always-on behavior above; see "Deferred" below.
+
+### The rejected design: a derived `{explanation}` field — and why
+
+The obvious-looking implementation — collapse the whole explanation line into one new derived
+placeholder, `{explanation}`, computed like `{span}` already is — was designed in detail and then
+**rejected** before writing any code, because it would have silently broken round 4's
+exact-recovery guarantee for **every future re-edit**, not just the NS ones. The reverse parser
+(`RW._dbParseDescription`) recovers fields by matching the **active template's structure**, not by
+inspecting rendered text: collapsing the line to one opaque placeholder means `where` (which has
+no other occurrence anywhere in the template) could never be reverse-parsed again on *any* reopen,
+NS-triggered or not — a real, universal regression to a feature this repo has spent three rounds
+building and protecting, not an edge case worth quietly accepting.
+
+**Fixed instead as a post-render text substitution**: the template text is never touched.
+`RW._dbFindNsExplanationLine(templateText)` locates the explanation line **structurally** — any
+template line whose tokens mention `thickness`, `span`, `source`, AND `where` together — rather
+than by literal wording, so it still finds the line after the annotator rewords the surrounding
+sentence, and simply returns `-1` (safe no-op) on a custom template that doesn't have this shape.
+`RW._dbNsExplanationText(values)` is the pure decision table above, returning `null` when neither
+condition applies. `RW._dbApplyNsExplanation(renderedText, templateText, values)` splices the
+override into the *already-rendered* text at that line index, preserving the line's own leading
+"label: " prefix (extracted via `/^([^:]*:\s*)/` from its first literal token, so a renamed label
+still works without hardcoding `"explanation: "`). `RW._dbComputeOutput` gains exactly one line
+after its existing render call — the same single function the preview, Fill, and the prefill
+exactness check already share, so the substitution is visible everywhere it needs to be for free,
+with **zero** changes to `RW._dbParseTemplate`, `RW._dbDerivedNames`, `RW._dbTokenizeTemplate`,
+`RW._dbBuildLineMatcher`, or `RW._dbParseDescription`.
+
+**The consequence, stated plainly**: the common (no-NS) case is a full no-op — byte-identical to
+today, confirmed against the existing headline test (7a) and the round-4 `{where}`/`{source}`
+recovery guarantee (new regression guard, test `22f`). Only a description that *was* produced with
+an NS condition active will, on a later reopen, fail to re-match that one line (test `22g` confirms
+this degrades gracefully — no crash, the other seven fields still recover fine) — exactly the same
+class of loss any hand-edited sentence already causes today, not a new failure mode.
+
+Spot-checked: disabled the one-line wiring in `RW._dbComputeOutput` (returned the plain render
+unconditionally) and confirmed *exactly* `22e` failed — its two siblings, `22e-2`/`22e-3`, passed
+**vacuously** (they're consistency checks between the preview and `RW._dbComputeOutput`/Fill,
+which still agree with each other even when both skip the substitution — the same "passes
+vacuously" pattern round 3's own spot-check discipline already documented for `13d-g`) — while
+every pure-function test (`22a`-`22d`, which call `RW._dbNsExplanationText`/
+`RW._dbApplyNsExplanation` directly, bypassing the wiring) stayed green, as expected; restored.
+`node --check` passes; `desc_loader.js` rebuilt clean (94059 bytes) and reconfirmed free of any
+control byte.
+
+**`verify_desc.js` — grew from 311 to 343 tests.** New section 22: `RW._dbIsNS` case/whitespace
+tolerance and every non-match; `RW._dbFindNsExplanationLine` locating the built-in line at index 4,
+returning -1 for a template missing any of the four required names, and finding it correctly after
+the surrounding literal text is reordered/reworded; `RW._dbNsExplanationText`'s full decision
+table against the sample values, byte-for-byte, including both single-sided and combined-elevation
+cases; `RW._dbApplyNsExplanation`'s no-ops (no matching line; neither condition active) and its
+line-splice with prefix preservation; the DOM/UI seam (preview and Fill agreeing exactly); the
+round-4 regression guard (`22f`); and the graceful-reopen guard (`22g`).
+
+### Deferred: generalized per-field conditional rules in Advanced
+
+The user's original request also asked, "if possible," for a way to configure this kind of
+substitution generally in Advanced (e.g. "when field X = value Y, use alternate text Z" for any
+field, not just thickness/elevation). Raised explicitly during planning and deferred by the user
+("skip this, but put for planning in the future") — not built this round. A future round could
+expose exactly this as a small rule list (condition + replacement text) alongside the template
+textarea, reusing `RW._dbIsNS`-style value matching; nothing in this round's design blocks that,
+since the post-render substitution mechanism here is itself a special case of "a conditional rule
+applied to the rendered text."
+
+**Not yet live-verified**: the exact wording's legibility inside the real Tailwind-styled modal;
+whether a real annotation job ever produces an elevation value that reads as NS-like without being
+the literal marker (e.g. `"n/s"` or `"N.S."`) and whether that should also be detected — not
+requested, not built, worth asking about if it comes up.
+
+## Round 9 — a SLAB thickness embedded in `bot`, kept independent of the WALL's own `{thickness}`
+
+Requested directly, extending round 8's NS machinery: in some conditions the true height/depth
+isn't a plain `TOW − TOF` (top − bot) — there's a slab of a given thickness sitting in between, so
+the real figure is `TOW − slab thickness − TOF`. Rather than a separate field or a keyword-based
+toggle, this is auto-detected from `bot`'s own raw text: entering `bot` as `2" - 0'-5"` means "a
+2\" slab, with the true TOF at 0'-5\""; the bare word `SLAB` (no number at all) means "there's a
+slab here, but its thickness isn't known" — both pieces (slab thickness *and* elevation) become
+unknown. The measurement line keeps showing `bot` **raw, exactly as typed** — no reformatting.
+
+**A real design bug the user caught before this ever reached a live page**: the first draft
+auto-filled *and read-only-locked* `{thickness}` from bot's detected value, on the assumption that
+"thickness" meant one thing throughout the template. It doesn't — `{thickness}` is the **wall's
+own** thickness (used in the `thickness: {thickness}` line and the explanation's own
+`{a} {thickness} {desc:lower} ...`, describing the wall itself), a completely different physical
+quantity from whatever slab happens to sit between that wall and the footing. Locking `{thickness}`
+to the slab's number meant the wall's real thickness could no longer be entered at all. **Fixed**
+by never touching `{thickness}` from `bot` in either direction: the detected slab thickness feeds
+*only* the span/height-depth arithmetic below, and `{thickness}` stays exactly what the annotator
+types, completely independent of whatever `bot` contains.
+
+`RW._dbParseBotThickness(botRaw)` detects the two shapes (bare `SLAB`, case-insensitive/trimmed
+like `RW._dbIsNS` → `{slabThickness:'NS', elevation:'NS'}`; or `"<slabThickness> - <elevation>"`,
+split on the first literal `" - "` — a bare negative sign like `-14'-0"` has no such pattern, so
+this never collides with a normal negative elevation — with both halves required to parse via
+`RW._dbParseFtIn`) and returns `null` for everything else, completely unaffected. The return
+property is named `slabThickness`, never `thickness`, specifically so a future reader can't make
+the same conflation the first draft did. `RW._dbComputeSpanWithThickness(top, bot, override)`
+wraps `RW._dbSpan`, returning the same `{value, source}` shape (a new `'computed-thickness'`
+source for the span-row tooltip) so every existing caller of `RW._dbSpan` for *display* purposes
+(the span row, the reverse parser's override-detection comparison, `RW._dbDetectTemplate`'s
+exact-match reconstruction) could switch to it with no shape changes needed elsewhere. An explicit
+span Override still always wins; the subtraction only applies when `RW._dbSpan` actually computed
+a real number and the detected slab thickness itself is known (not the bare-`SLAB` case, where
+there's nothing to subtract either).
+
+### Round 8's elevation-NS wording still needs to see bot's *extracted* elevation, not its raw text
+
+`RW._dbComputeOutput` (and, separately, `RW._dbDetectTemplate`'s exact-match reconstruction) both
+substitute `bot`'s *extracted elevation* (`RW._dbParseBotThickness(values.bot).elevation`) in place
+of the raw value, right before calling `RW._dbApplyNsExplanation` — a bare `SLAB` bot has no
+elevation given either, so it must read as `NS` there too (which is exactly what
+`RW._dbParseBotThickness` returns for that shape); a compound bot's real extracted elevation (e.g.
+`"0'-5\""`) correctly stays "known". This substitution only ever touches the *elevation* side of
+round 8's check — it has nothing to do with `{thickness}`, which round 8's
+`RW._dbNsExplanationText` still reads directly off `values.thickness`, completely unaffected by
+anything `bot` contains. A real gap was caught here too, before the independence fix: the first
+pass of this substitution assumed reusing the literal `'NS'` marker would "just work" through
+round 8's existing machinery — true for the elevation side, but it doesn't imply anything about
+`{thickness}` at all, which is exactly the point of this round's correction.
+
+A second, unrelated gap surfaced while touching `RW._dbDetectTemplate` for the span-recompute fix:
+its exact-match reconstruction called `RW._dbRender` directly, **bypassing `RW._dbApplyNsExplanation`
+entirely** — meaning any label using round 8's NS-wording was never recognized as an exact
+byte-for-byte match during template auto-detection (a latent round-8 gap, not something round 8's
+own tests happened to exercise). Fixed in the same pass, since the fix is one line once the
+substitution above already exists.
+
+### What stayed untouched, and why
+
+The measurement line (`{word}: {top:brk} - {bot:brk}`) needed no changes: `bot`'s raw text — the
+whole compound string, or bare `SLAB` — simply renders bare under `:brk` either way, since neither
+shape parses as a *negative* feet-inches value (the only case `:brk` brackets). The reverse parser
+needed no changes either: `bot`'s own line recovers the raw compound text verbatim on reopen (it's
+just free text, same as any datum name — its capture is the line's last, so it's greedy and
+doesn't stop at the internal `" - "`), and `{thickness}`'s own line independently recovers whatever
+the annotator actually typed there — untouched by any of this, so the two values simply can't
+diverge, because nothing ever couples them.
+
+Spot-checked twice: (1) reverted `RW._dbComputeOutput`'s call back to plain `RW._dbSpan` and
+confirmed *exactly* the arithmetic-dependent tests (`23e-2`, `23f-5`) failed, with everything
+else — including round 8's entire section 22 — staying green; restored. (2) Reintroduced the
+original (wrong) auto-fill-from-bot behavior and confirmed *exactly* the independence tests
+(`23c`, `23c-5`, `23d`, `23d-2`, `23d-3`, `23e-3`, `23e-4`) failed — the tests written specifically
+to catch this class of regression actually catch it; restored. `node --check` passes;
+`desc_loader.js` rebuilt clean (99469 bytes) and reconfirmed free of any control byte.
+
+**`verify_desc.js` — grew from 343 to 380 tests.** New section 23: `RW._dbParseBotThickness`'s two
+detected shapes (returning `slabThickness`, never `thickness`) and every non-match (plain
+elevation, datum name, plain `NS`, blank, a malformed compound with one unparseable side);
+`RW._dbComputeSpanWithThickness`'s arithmetic, its bare-`SLAB` fallback, Override precedence, a
+non-computed top, and a byte-for-byte regression guard against plain `RW._dbSpan` for an ordinary
+bot; the **independence guard** — a compound or bare-`SLAB` bot never writes, read-onlies, or
+disables anything on `{thickness}`, in either direction, with two different thickness values
+present simultaneously to make any cross-contamination obvious; bare `SLAB` triggering only
+round 8's elevation-NS wording while the wall's own (separately known) thickness renders
+completely normally in the same sentence; the combined wording still working when both are
+marked unknown *independently* (bot's own format, plus the wall's own NS button); the full DOM/UI
+seam with two different, simultaneous thickness values (raw measurement line, slab-adjusted span,
+wall's own thickness in the explanation and its own line, preview/Fill agreement); reopening a
+label written this way (both thicknesses recovered independently and correctly, `{thickness}`
+fully editable again, and — the regression this round specifically guards against — the span
+override-detection comparison does **not** false-positive); and that an ordinary `bot` value never
+triggers any of this.
+
+**Not yet live-verified**: whether a real annotation job ever needs `top` to carry a similar
+embedded-thickness format (not requested, not built — only `bot` is special-cased); and whether
+the specific separator `" - "` (space-hyphen-space) ever collides with some other bot convention
+not yet seen in practice.
 
 ## Constraints (do not violate)
 
