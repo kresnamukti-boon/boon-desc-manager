@@ -30,7 +30,7 @@ synthetic harness `verify_desc.js` is the whole verification story.
 ```bash
 bash build_loader.sh          # rebuilds desc_loader.js (runs node --check on the result)
 node --check rw_descbuilder.js
-node verify_desc.js           # synthetic harness — 247 tests, all passing
+node verify_desc.js           # synthetic harness — 311 tests, all passing
 ```
 
 To actually verify a change works, it has to be pasted into a real annotation-job page in Chrome
@@ -261,7 +261,11 @@ a direct port, not a reinvention:
   below).
 - **No `fetch`/XHR to any backend endpoint. Page-scoped, console-injection only.**
 - **What the preview shows is exactly what Fill writes.** The preview and the write-back share one
-  function, `RW._dbComputeOutput`, so there's no way for them to drift apart.
+  function, `RW._dbComputeOutput`, so there's no way for them to drift apart. Round 6's
+  whole-description override (see below) *strengthens* this rather than bending it: engaging the
+  override just changes what `RW._dbComputeOutput` returns (the hand-typed text instead of a
+  render), so the single-function invariant covers the override case for free — there was never a
+  second write path to keep in sync.
 - **A non-empty textarea needs a second click.** `RW._dbRunFill`'s two-click overwrite guard
   protects a hand-written description from being clobbered by one stray click on Fill. Deliberately
   **left unchanged in round 4**: on "Edit Label" the textarea is always non-empty, so Fill always
@@ -602,6 +606,188 @@ own three tests failed; both restored.
 **Not yet live-verified**: whether `localStorage` behaves identically on the real page (no reason
 to expect otherwise, but not directly observed) and whether a genuinely large or malformed custom
 template ever produces a confusing state Reset to default doesn't cleanly resolve.
+
+## Round 6 — a named collection of templates, auto-detected on Edit, plus a whole-description override
+
+Two requests this round. First: "add multiple template, so when the sources is different, there
+are multiple template to be selected, and when i manually add those template, these persists in
+next instances" — round 5 made *one* custom template persist across a reload, but a drawing
+source's house format genuinely differs from another's, so switching source still meant retyping
+the whole template into the Advanced textarea. Second, requested alongside it: "add override mode
+for the whole proposed description" — an escape hatch for text a template genuinely can't
+represent, so hand-editing no longer has to happen downstream of Fill, in the host's own textarea
+where this add-on can no longer see it.
+
+### The load-bearing design decision: `RW._dbDefaultTemplate` stays a mirror
+
+`RW._dbDefaultTemplate` is now defined as *a mirror of the active template entry's text*, not a
+standalone value. Every existing consumer already reads either `#rw-db-template`'s value or
+`RW._dbDefaultTemplate` (`RW._dbCollectValues`, `RW._dbRebuildFields`, `RW._dbResetFields`,
+`RW._dbReadPrefill`, `RW._dbRereadPrefill`, the fresh-open path in `onLabelModalMutation`), so
+keeping that mirror invariant means **none of them needed to change** for this round — only
+`RW._dbSetActiveTemplate` and the template textarea's own `input` listener ever write it. The name
+is now slightly imprecise (it mirrors the *active* entry, not "the" template), but renaming it
+would touch every existing consumer and break any console override an annotator already has;
+documenting it here was judged better than a rename.
+
+### Storage: a collection, validated on read, with one pristine-forgetting writer
+
+`RW._dbTemplates` is now an array of `{ name, text }`, persisted as JSON under a new
+`RW._dbTemplatesStorageKey` (`'rwDescTemplates'`), alongside `RW._dbActiveTemplateName` under
+`RW._dbActiveTemplateStorageKey` (`'rwDescActiveTemplate'`). `RW._dbTemplateStorageKey` — round
+5's original single-template key — is now **read-only**: nothing writes to it any more; it's
+consulted exactly once, at install, as a one-time migration path (a single legacy template with no
+new-style collection yet is adopted as one `"Default"` entry, loading and selecting exactly as it
+did before this round). This is genuinely new ground for the family: no other repo persists a
+*structured* value — every existing one (`boon-tagger-darkmode`'s own `storageGet`/`storageSet`,
+and round 5's own single template) is a plain string read back with a can't-throw equality guard.
+What's extended here is the *shape of the discipline*, not a serializer: `dbLoadTemplates` wraps
+`JSON.parse` inside the same `try` as the storage read, so a throw from either yields exactly
+"nothing saved," and `dbValidateTemplates` then drops malformed entries and duplicate names
+(case-insensitive, first occurrence wins) rather than rejecting the whole blob — falling back to
+the built-in collection only if nothing valid survives at all.
+
+`dbPersist()` is the single writer for both keys, and owns one rule that replaces what would
+otherwise be special-casing inside Reset: a **pristine** collection — exactly one entry, named
+`"Default"`, holding the built-in text — has nothing worth remembering, so both keys are removed
+rather than written. This is what keeps round 5's tested "forgotten, not merely overwritten"
+guarantee (`verify_desc.js` §19f) true, unchanged, in the original single-template case, with no
+branching added to `RW._dbResetTemplateToDefault` itself.
+
+### Auto-detect on "Edit Label"
+
+`RW._dbDetectTemplate(descText)` reverse-parses the description against *every* saved template
+(reusing `RW._dbParseDescription` — no new parsing logic) and returns the best match, ranked: an
+**exact** byte-for-byte re-render (the same honest test `RW._dbShowPrefill` already applies,
+computed here purely, before anything reaches the DOM) outranks every heuristic; then
+`matchedLines`, then `confidence`, `recovered.length`, and fewer `weak` fields; a genuine tie goes
+to the **currently active** template, then to collection order. It returns `null` when nothing
+anchored matched anything at all (every candidate's `matchedLines` stays 0), in which case the
+active template is left alone. The fresh-open path in `onLabelModalMutation` calls it before
+`RW._dbReadPrefill`, switching the active template first (via `RW._dbSetActiveTemplate(name,
+true)` — `skipRebuild=true`, since `RW._dbResetFields`'s own rebuild runs immediately after) so a
+label from a different source parses against *its* template, not whatever was active before the
+modal opened.
+
+### Template management (Advanced only) and the picker (Simple + Advanced)
+
+`RW._dbSaveTemplateAs`/`RW._dbRenameTemplate`/`RW._dbDeleteTemplate` follow the same
+inline-refusal discipline as `RW._dbInsertVariable` (blank name, name over 40 characters, a
+case-insensitive duplicate, or — for Delete — the last remaining entry, all reported in
+`#rw-db-tpl-status` rather than silently ignored). `RW._dbResetTemplateToDefault` is rescoped to
+the **active** entry only — a sibling template is left untouched, and Delete is the new way out of
+a bad *added* template. The picker (`#rw-db-template-select`) shows in Simple mode too (picking a
+source template is an everyday action) but only once `RW._dbTemplates.length > 1` — a one-option
+dropdown is pure noise, so Simple mode stays byte-identical for anyone who never adds a template;
+it's always shown in Advanced.
+
+### Whole-description override
+
+An **Override** button next to the preview swaps the read-only `<pre>` for an editable textarea
+seeded with whatever the preview currently showed; `✕` discards it — a deliberate copy of the span
+row's own Override/✕ idiom, one level up. It hangs off a single line in `RW._dbComputeOutput`:
+return `RW._dbOutputOverrideValue` when `RW._dbOutputOverridden`, otherwise render as before.
+Because the preview, Fill, and the prefill row's byte-for-byte exactness check already all go
+through that one function, none of them needed to change — see the strengthened invariant above.
+
+**It auto-engages** when `applyPrefill` sees an Edit modal whose description matched *no* saved
+template at all (`RW._dbLastPrefill.applied === false` with a non-blank baseline) — precisely the
+case where the builder was previously at its worst: fields blank, the preview showing the template
+rendered with empty values, Fill one confirmation away from replacing a real description with
+that. The override engages instead, seeded with the original text verbatim, ready to hand-edit; the
+prefill status row says so (`... — override on, keeping it as-is`). The decision runs after every
+clear `applyPrefill` already does (span override, prefill baseline) — the same ordering discipline
+round 4 learned the hard way with the span override (test `17j`) — though empirically (see
+spot-checks below) this particular decision turned out not to depend on that ordering, since it
+reads only `RW._dbLastPrefill`, which those clears never touch; the ordering is kept anyway; as the
+one place a future change to either could introduce a real dependency between them.
+
+The override is session-scoped, per-label content — never persisted — and is dropped by `✕`, by
+**Clear**, by **Re-read**, and by any fresh modal open, all of which already route through
+`applyPrefill`.
+
+### The DOM stub's `<select>` gap
+
+The harness's DOM stub had no `<select>` model at all: `options`/`selectedIndex` didn't exist, and
+`value` was an inert plain property that (unlike a real `<select>`) never auto-initialized to the
+first option. Since this module only ever *writes* `sel.value` and *reads* it inside a `change`
+listener — a deliberately narrow contract, chosen specifically so it wouldn't need more from the
+stub than that — the picker was testable by having tests set `.value` directly before firing
+`change`. Minimal `options` (a getter over `_children` filtered to `OPTION`) and `selectedIndex`
+(derived by matching `value`) accessors were added anyway, so the stub can't silently bless
+something a real browser would reject, per round 1's own precedent (the `removeChild`
+subtree-unregister bug) that a harness gap gets fixed in the harness, never by reshaping the module
+to suit the stub.
+
+### Spot-checks — including two that, tested honestly, turned out not to be load-bearing
+
+Per this repo's own convention: revert one change, confirm *exactly* the expected tests fail,
+restore.
+
+- Dropping the mirror write (`dbActiveTemplate().text = templateEl.value`) in the template
+  textarea's `input` listener: confirmed exactly `19b`, the `19f` precondition, `20m-2`, `20n`, and
+  `20o` fail (the last crashing the harness outright on a null DOM lookup, since the wrong
+  template's fields never get generated) — restored.
+- Inverting the tie-break in `RW._dbDetectTemplate`'s ranking (prefer the *inactive* side of a
+  genuine tie): confirmed exactly the two tests built specifically to exercise a real tie (`20n-3`,
+  `20n-4`, using two structurally identical templates differing only in variable name) fail,
+  nothing else — restored. (The two, already-planned auto-detect tests `20n`/`20o` never actually
+  reach a tie, since only one candidate template ever has `matchedLines > 0` in those fixtures —
+  the dedicated tie fixture was added specifically because those didn't cover it.)
+- Dropping the override branch from `RW._dbComputeOutput`: confirmed exactly the four tests that
+  depend on it (`21c`, `21c-2`, `21d`, `21g-4`) fail, nothing in section 20 — restored.
+- Two spot-checks that were planned but, tested honestly, turned out **not** to be load-bearing —
+  reported here rather than silently dropped, since claiming a guard "confirmed" without actually
+  running it would be exactly the kind of unverified claim this repo's own convention exists to
+  catch:
+  - Dropping `skipRebuild=true` from the auto-detect hook's `RW._dbSetActiveTemplate` call:
+    produces **no** test failures. The extra rebuild it would otherwise trigger uses stale
+    (about-to-be-discarded) field values, but `RW._dbResetFields`'s own authoritative rebuild runs
+    immediately after and overwrites everything — so `skipRebuild` is currently a performance
+    optimization only (skip one redundant, harmless rebuild), not a correctness guard. Left in
+    place as documented intent for a future change that might make the interleaving matter.
+  - Moving the override auto-engage decision to *before* `applyPrefill`'s span/prefill-baseline
+    clears (rather than after, as shipped): also produces **no** test failures, unlike the
+    analogous round-4 span-override case. The reason the two differ: the span-override recovery
+    reads `prefill.span`, which is influenced by the very clear it must run after; the
+    whole-description auto-engage decision reads only `RW._dbLastPrefill` (set earlier, by
+    `RW._dbReadPrefill`, and never touched by `applyPrefill`'s clears at all), so there is no
+    actual ordering dependency for this specific decision today. The ordering is kept regardless,
+    matching the general discipline, since a future change to either clear could introduce one.
+
+`node --check` passes on both files; `desc_loader.js` rebuilt clean (88391 bytes) and reconfirmed
+free of any control byte (the round-2 lesson) with a corrected scan — the naive
+`[^\x09\x0a\x20-\x7e]` pattern this repo's own commands have used before flags every legitimate
+UTF-8 em-dash in the prose comments as a false positive; the real check is
+`[\x00-\x08\x0B-\x1F\x7F]` (actual control bytes only), which comes back clean.
+
+**`verify_desc.js` — grew from 247 to 311 tests.** New section 20 covers the template collection
+directly: resolution and validation (a seeded valid collection wins over the built-in; corrupt or
+wrong-shaped JSON falls back without throwing; throwing storage falls back in-memory only; a
+console override on `RW._dbTemplates` wins over storage; a console override on
+`RW._dbDefaultTemplate` still wins as the active entry's text, per round 5's unbroken contract);
+the legacy single-template migration; an unknown stored active name falling back to entry 0; an
+edit landing in the active entry, surviving a same-session reopen, and leaving a sibling entry's
+text untouched; both the collection and the active selection surviving a simulated reload (a
+second stub window sharing the same underlying storage object); every management refusal
+(blank/duplicate name, deleting the last template); Reset touching only the active entry; the
+auto-detect DOM seam end to end (an Edit modal's description matching the *second* saved template
+switches the picker and prefills exactly; an unrelated description switches nothing; a Create
+modal never runs detection at all); the dedicated tie-break fixture described above; and the
+picker's own visibility gating (hidden in Simple with one template, shown in Advanced regardless,
+shown in Simple once a second template exists). New section 21 covers the whole-description
+override: manual engage/revert seeded from the live preview, typing driving both the preview and
+Fill verbatim, field edits leaving an active override unchanged, the override being cleared by a
+modal reopen/Clear/Re-read, the auto-engage case (seeded verbatim, Fill reproducing the original
+exactly), and that a Create modal or a successfully-prefilled Edit modal never auto-engages.
+
+**Not yet live-verified**: the template picker's and management buttons' actual legibility and
+layout inside the real, Tailwind-styled modal, and whether the panel still fits comfortably under
+the existing 40vh height cap with these new rows (proven only against the synthetic stub); whether
+real annotation descriptions in the wild match a saved template as cleanly as the synthetic
+fixtures here, or trigger the override auto-engage more often than expected; and whether
+`localStorage`'s JSON round-trip behaves identically on the real page for a genuinely large
+collection of templates (no reason to expect otherwise, but not directly observed).
 
 ## Constraints (do not violate)
 

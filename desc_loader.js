@@ -601,12 +601,18 @@
     };
   };
 
-  /* ---------- template persistence (deliberate deviation from this family's no-persistence
-     convention, confirmed with the user — see CLAUDE.md) — never throws, private window /
-     blocked site data degrades silently to in-memory only, matching boon-tagger-darkmode's own
-     storageGet/storageSet pattern ---------- */
+  /* ---------- template persistence: a NAMED COLLECTION of templates, not one saved template
+     (round 6 — a drawing source's house format genuinely differs from another's, so switching
+     source now means picking from a dropdown rather than retyping the whole template). Still a
+     deliberate deviation from this family's no-persistence convention (confirmed with the user —
+     see CLAUDE.md), still never throws, still degrades silently to in-memory only on a private
+     window / blocked site data, matching boon-tagger-darkmode's own storageGet/storageSet
+     pattern. RW._dbTemplateStorageKey is round 5's ORIGINAL single-template key — nothing writes
+     to it any more, it is read exactly once, at install, as a one-time migration path below. ---------- */
 
-  RW._dbTemplateStorageKey = RW._dbTemplateStorageKey || 'rwDescTemplate';
+  RW._dbTemplateStorageKey = RW._dbTemplateStorageKey || 'rwDescTemplate'; // legacy — read-only now
+  RW._dbTemplatesStorageKey = RW._dbTemplatesStorageKey || 'rwDescTemplates';
+  RW._dbActiveTemplateStorageKey = RW._dbActiveTemplateStorageKey || 'rwDescActiveTemplate';
 
   function dbStorageGet(key){
     try { return window.localStorage.getItem(key); } catch (e) { return null; }
@@ -630,20 +636,106 @@
     'explanation: The detail shows {a} {thickness} {desc:lower} {keyword:lower} with the {word} of {span}. the thickness can be found in {source} table within the same page while the {word} can be found in {where}',
   ].join('\n');
 
-  // The CURRENT effective default — what a fresh modal open resets the template box to (see
-  // RW._dbResetFields) and what RW._dbReadPrefill parses a fresh Edit description against.
-  // Layered, in priority order: a console override set before this module ever ran (the `||`
-  // below) — unchanged, existing behavior — then a template saved in a previous session, then
-  // the built-in default. A blank/whitespace-only stored value is treated as nothing having been
-  // saved, never as an intentional blank template. Kept current by the template textarea's own
-  // `input` listener (RW._dbBuildPanel), which is also the one place that saves it back out —
-  // so editing the template now survives both a same-session modal reopen (a gap that predates
-  // this feature — RW._dbResetFields always stomped the box back to the ORIGINAL built-in
-  // default, discarding any edit) and, via storage, an actual page reload.
-  RW._dbDefaultTemplate = RW._dbDefaultTemplate || (function(){
-    const stored = dbStorageGet(RW._dbTemplateStorageKey);
-    return (stored && stored.trim()) ? stored : RW._dbBuiltinDefaultTemplate;
+  // Validates a parsed JSON blob as a template collection: a non-empty array of { name, text }
+  // entries, name a non-blank string, text a string. Malformed entries and duplicate names
+  // (case-insensitive — first occurrence wins) are dropped rather than rejecting the whole
+  // collection outright; if NOTHING valid survives, returns null so the caller falls back to the
+  // built-in collection — the same "treat it as nothing saved" discipline round 5 already applies
+  // to a whitespace-only single template. Never throws.
+  function dbValidateTemplates(list){
+    if (!Array.isArray(list)) return null;
+    const seen = new Set();
+    const out = [];
+    for (const entry of list){
+      if (!entry || typeof entry.name !== 'string' || typeof entry.text !== 'string') continue;
+      const name = entry.name.trim();
+      if (!name) continue;
+      const key = name.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ name: name, text: entry.text });
+    }
+    return out.length ? out : null;
+  }
+
+  // Loads the saved collection from storage, validated. Returns null when nothing valid was saved
+  // (never saved, corrupt JSON, or a validation failure) — the caller falls back to the built-in
+  // collection. The JSON.parse lives inside the same try as the storage read, so a throw from
+  // either one yields exactly the same "nothing saved" outcome dbStorageGet's own catch does.
+  function dbLoadTemplates(){
+    const raw = dbStorageGet(RW._dbTemplatesStorageKey);
+    if (!raw) return null;
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch (e) { return null; }
+    return dbValidateTemplates(parsed);
+  }
+
+  function dbFindTemplate(name){
+    for (const t of RW._dbTemplates) if (t.name === name) return t;
+    return null;
+  }
+
+  // Never returns undefined — falls back to entry 0 when RW._dbActiveTemplateName names nothing
+  // that currently exists (a stale/renamed/deleted selection).
+  function dbActiveTemplate(){
+    return dbFindTemplate(RW._dbActiveTemplateName) || RW._dbTemplates[0];
+  }
+
+  // The one writer for both template-persistence keys. A PRISTINE collection — exactly one entry,
+  // named "Default", holding the built-in text — has nothing worth remembering, so it's forgotten
+  // (both keys removed) rather than written. This single rule is what keeps
+  // RW._dbResetTemplateToDefault's existing "forgotten, not merely overwritten" guarantee (round
+  // 5) true in the original single-template case, with no special-casing inside Reset itself.
+  function dbPersist(){
+    const pristine = RW._dbTemplates.length === 1
+      && RW._dbTemplates[0].name === 'Default'
+      && RW._dbTemplates[0].text === RW._dbBuiltinDefaultTemplate;
+    if (pristine){
+      dbStorageRemove(RW._dbTemplatesStorageKey);
+      dbStorageRemove(RW._dbActiveTemplateStorageKey);
+      return;
+    }
+    try { dbStorageSet(RW._dbTemplatesStorageKey, JSON.stringify(RW._dbTemplates)); }
+    catch (e) { /* a value that can't stringify is simply not saved — never throws */ }
+    dbStorageSet(RW._dbActiveTemplateStorageKey, RW._dbActiveTemplateName);
+  }
+
+  // Console override precedence, captured BEFORE anything below ever touches
+  // RW._dbDefaultTemplate — this is what preserves round 5's existing "a console override set
+  // before this module ever ran wins" contract unchanged.
+  const dbConsoleTemplateOverride = RW._dbDefaultTemplate;
+
+  // The effective collection, in priority order: a console override (RW._dbTemplates set before
+  // this module ran) → a collection saved in a previous session → a round-5-style single legacy
+  // template migrated in as one "Default" entry (an existing user's saved template still loads
+  // and is selected exactly as it did before this round) → the built-in default, alone.
+  RW._dbTemplates = dbValidateTemplates(RW._dbTemplates)
+    || dbLoadTemplates()
+    || (function(){
+      const legacy = dbStorageGet(RW._dbTemplateStorageKey);
+      if (legacy && legacy.trim()) return [{ name: 'Default', text: legacy }];
+      return [{ name: 'Default', text: RW._dbBuiltinDefaultTemplate }];
+    })();
+
+  // The active selection: a saved name that still names a surviving entry wins; otherwise entry 0.
+  RW._dbActiveTemplateName = (function(){
+    const stored = dbStorageGet(RW._dbActiveTemplateStorageKey);
+    return (stored && dbFindTemplate(stored)) ? stored : RW._dbTemplates[0].name;
   })();
+
+  // A console override wins over everything, including a saved/migrated collection — applied to
+  // the ACTIVE entry's text in memory only (never persisted), so the mirror invariant just below
+  // still holds for every existing consumer.
+  if (dbConsoleTemplateOverride && String(dbConsoleTemplateOverride).trim()){
+    dbActiveTemplate().text = dbConsoleTemplateOverride;
+  }
+
+  // The CURRENT effective default — kept as a MIRROR of the active entry's text, not a standalone
+  // value, so every existing consumer (RW._dbCollectValues, RW._dbRebuildFields,
+  // RW._dbResetFields, RW._dbReadPrefill, RW._dbRereadPrefill, the fresh-open path) needs no
+  // changes at all for this round. Only RW._dbSetActiveTemplate and the template textarea's own
+  // `input` listener ever write it.
+  RW._dbDefaultTemplate = dbActiveTemplate().text;
 
   RW._dbSuggestions = RW._dbSuggestions || {
     word: ['height', 'depth'],
@@ -696,6 +788,11 @@
   RW._dbLastValues = RW._dbLastValues || null;
   RW._dbSpanOverridden = false;
   RW._dbSpanOverrideValue = '';
+  // A whole-description override (round 6): hand-edited text that replaces the generated output
+  // entirely, for whatever a template genuinely can't express. Session-scoped, per-label content
+  // — never persisted, and reset by applyPrefill on every fresh modal open, Clear, and Re-read.
+  RW._dbOutputOverridden = false;
+  RW._dbOutputOverrideValue = '';
   RW._dbFillArmed = false;
   // Expanded by default; the collapse caret shrinks the whole panel down to its header strip —
   // the one-click way to get it fully out of the way of the host's own Cancel/Save row without
@@ -765,7 +862,13 @@
     return { templateText, names, values };
   };
 
+  // Round 6: when RW._dbOutputOverridden, this returns the hand-typed override text instead of
+  // rendering — the ONE line the whole whole-description-override feature hangs off. Because the
+  // preview, Fill, and the prefill row's byte-for-byte exactness check all already go through this
+  // single function, none of them need to change: "what the preview shows is exactly what Fill
+  // writes" holds for the override too, for free.
   RW._dbComputeOutput = function(){
+    if (RW._dbOutputOverridden) return RW._dbOutputOverrideValue;
     const { templateText, values } = RW._dbCollectValues();
     if (RW._dbTemplateUsesSpan(templateText)){
       const overrideVal = RW._dbSpanOverridden ? (RW._dbSpanOverrideValue || '') : '';
@@ -777,6 +880,50 @@
   RW._dbRunPreview = function(){
     const pre = document.getElementById('rw-db-preview');
     if (pre) pre.innerText = RW._dbComputeOutput();
+  };
+
+  /* ---------- whole-description override (round 6): a template can't represent everything, so
+     this is the escape hatch for the text a template genuinely can't express — a deliberate copy
+     of the span row's own Override/✕ idiom, one level up. Everything hangs off the single line in
+     RW._dbComputeOutput above: the preview, Fill, and the prefill exactness check all already
+     share that one function, so none of them need to change for this feature. ---------- */
+
+  // Toggles the override on/off. Engaging seeds the override text from `seedText` when given (the
+  // auto-engage path below, seeding the untouched original description) or, when omitted, from
+  // whatever the preview currently shows (the manual Override button) — computed BEFORE the flag
+  // flips, since RW._dbComputeOutput itself consults it.
+  RW._dbSetOutputOverridden = function(on, seedText){
+    if (on){
+      RW._dbOutputOverrideValue = seedText != null ? seedText : RW._dbComputeOutput();
+      RW._dbOutputOverridden = true;
+    } else {
+      RW._dbOutputOverridden = false;
+      RW._dbOutputOverrideValue = '';
+    }
+    RW._dbApplyOutputOverrideUI();
+    RW._dbRunPreview();
+  };
+
+  // Swaps the read-only preview for an editable textarea (or back) and updates the standing
+  // status note. The textarea's value is synced here — on every ENGAGE/DISENGAGE, not on every
+  // keystroke — its own `input` listener (RW._dbBuildPanel) updates RW._dbOutputOverrideValue
+  // directly instead, so typing never fights the caret.
+  RW._dbApplyOutputOverrideUI = function(){
+    const pre = document.getElementById('rw-db-preview');
+    const ta = document.getElementById('rw-db-output-override');
+    const status = document.getElementById('rw-db-output-status');
+    const overrideBtn = document.getElementById('rw-db-output-override-btn');
+    const revertBtn = document.getElementById('rw-db-output-revert-btn');
+    if (pre) pre.style.display = RW._dbOutputOverridden ? 'none' : '';
+    if (ta){
+      ta.style.display = RW._dbOutputOverridden ? '' : 'none';
+      if (RW._dbOutputOverridden) ta.value = RW._dbOutputOverrideValue;
+    }
+    if (overrideBtn) overrideBtn.style.display = RW._dbOutputOverridden ? 'none' : '';
+    if (revertBtn) revertBtn.style.display = RW._dbOutputOverridden ? '' : 'none';
+    if (status) status.innerText = RW._dbOutputOverridden
+      ? 'manual override — the fields below are not used for this description'
+      : '';
   };
 
   // Rebuilds #rw-db-fields from the current template text: a row per placeholder, in
@@ -902,22 +1049,180 @@
   RW._dbApplyAdvancedVisibility = function(){
     const templateWrap = document.getElementById('rw-db-template-wrap');
     const addVarWrap = document.getElementById('rw-db-addvar-wrap');
+    const tplMgrWrap = document.getElementById('rw-db-tplmgr-wrap');
     const toggle = document.getElementById('rw-db-adv-toggle');
     if (templateWrap) templateWrap.style.display = RW._dbAdvanced ? '' : 'none';
     if (addVarWrap) addVarWrap.style.display = RW._dbAdvanced ? '' : 'none';
+    if (tplMgrWrap) tplMgrWrap.style.display = RW._dbAdvanced ? '' : 'none';
     if (toggle) toggle.innerText = RW._dbAdvanced ? 'Simple' : 'Advanced';
+    RW._dbApplyTemplateSelectVisibility();
+  };
+
+  /* ---------- template selection + management (round 6: a named collection, not one saved
+     template) ---------- */
+
+  // The picker shows in Simple mode too — picking a source template is an everyday action — but
+  // only once there's a real choice to make; a single-entry dropdown is pure noise, so Simple
+  // mode stays byte-identical for anyone who never adds a template. Always shown in Advanced.
+  RW._dbApplyTemplateSelectVisibility = function(){
+    const wrap = document.getElementById('rw-db-tplsel-wrap');
+    if (!wrap) return;
+    wrap.style.display = (RW._dbAdvanced || RW._dbTemplates.length > 1) ? '' : 'none';
+  };
+
+  // Rebuilds #rw-db-template-select's <option>s from RW._dbTemplates and syncs its value to the
+  // active name. Every mutating action below calls this, so the picker and the collection can
+  // never drift apart; it also re-evaluates the picker's own visibility, since the collection's
+  // size is exactly what decides that.
+  RW._dbRenderTemplateSelect = function(){
+    const sel = document.getElementById('rw-db-template-select');
+    if (sel){
+      clearChildren(sel);
+      for (const t of RW._dbTemplates) sel.appendChild(mkEl('option', { value: t.name, innerText: t.name }));
+      sel.value = RW._dbActiveTemplateName;
+    }
+    RW._dbApplyTemplateSelectVisibility();
+  };
+
+  // Switches the active template: mirrors its text into RW._dbDefaultTemplate (the invariant
+  // every other consumer already relies on) and into the template textarea if present, persists
+  // the selection, and re-renders the picker. Setting a textarea's `.value` programmatically does
+  // NOT fire `input` (the same gap RW._dbInsertVariable already works around by dispatching one
+  // itself), so this function does the rebuild itself rather than relying on that listener.
+  // `skipRebuild` lets the Edit-modal auto-detect hook (RW._dbDetectTemplate, below) switch
+  // templates just before RW._dbResetFields runs its own authoritative rebuild, without doing the
+  // rebuild twice.
+  RW._dbSetActiveTemplate = function(name, skipRebuild){
+    const entry = dbFindTemplate(name);
+    if (!entry) return;
+    RW._dbActiveTemplateName = entry.name;
+    RW._dbDefaultTemplate = entry.text;
+    const templateEl = document.getElementById('rw-db-template');
+    if (templateEl) templateEl.value = entry.text;
+    dbPersist();
+    RW._dbRenderTemplateSelect();
+    if (!skipRebuild) RW._dbRebuildFields();
+  };
+
+  // Shared validation for Save-as-new and Rename: refuse a blank name, a name over 40 characters,
+  // or a name already in use (case-insensitively) — reported inline via `statusEl` rather than
+  // silently ignored, matching RW._dbInsertVariable's own refusal discipline. `ignoreName` lets
+  // Rename validate against every OTHER entry without tripping over the active entry's own
+  // (about-to-be-replaced) name.
+  function dbValidTemplateName(name, statusEl, ignoreName){
+    name = (name || '').trim();
+    if (!name){ if (statusEl) statusEl.innerText = 'give the template a name first'; return null; }
+    if (name.length > 40){ if (statusEl) statusEl.innerText = 'template name is too long (40 characters max)'; return null; }
+    const dup = RW._dbTemplates.some((t) => t.name.toLowerCase() === name.toLowerCase() && t.name !== ignoreName);
+    if (dup){ if (statusEl) statusEl.innerText = '"' + name + '" already exists — pick a different name'; return null; }
+    return name;
+  }
+
+  // Saves the CURRENT template textarea's text as a brand-new named entry and selects it — the
+  // escape hatch for a source whose format doesn't match anything saved yet.
+  RW._dbSaveTemplateAs = function(rawName){
+    const statusEl = document.getElementById('rw-db-tpl-status');
+    const nameEl = document.getElementById('rw-db-tpl-name');
+    const templateEl = document.getElementById('rw-db-template');
+    const name = dbValidTemplateName(rawName, statusEl);
+    if (!name) return;
+    RW._dbTemplates.push({ name: name, text: templateEl ? templateEl.value : RW._dbDefaultTemplate });
+    RW._dbSetActiveTemplate(name);
+    if (statusEl) statusEl.innerText = '';
+    if (nameEl) nameEl.value = '';
+  };
+
+  // Renames the ACTIVE entry in place (its text is untouched) and keeps the selection on it —
+  // same validation as Save as new.
+  RW._dbRenameTemplate = function(rawName){
+    const statusEl = document.getElementById('rw-db-tpl-status');
+    const nameEl = document.getElementById('rw-db-tpl-name');
+    const entry = dbActiveTemplate();
+    const name = dbValidTemplateName(rawName, statusEl, entry.name);
+    if (!name) return;
+    entry.name = name;
+    RW._dbActiveTemplateName = name;
+    dbPersist();
+    RW._dbRenderTemplateSelect();
+    if (statusEl) statusEl.innerText = '';
+    if (nameEl) nameEl.value = '';
+  };
+
+  // Drops the active entry and selects entry 0 — refused when it's the only one left, since
+  // there must always be something selected.
+  RW._dbDeleteTemplate = function(){
+    const statusEl = document.getElementById('rw-db-tpl-status');
+    if (RW._dbTemplates.length <= 1){
+      if (statusEl) statusEl.innerText = "can't delete the last remaining template";
+      return;
+    }
+    const idx = RW._dbTemplates.indexOf(dbActiveTemplate());
+    if (idx !== -1) RW._dbTemplates.splice(idx, 1);
+    RW._dbSetActiveTemplate(RW._dbTemplates[0].name);
+    if (statusEl) statusEl.innerText = '';
   };
 
   // The escape hatch a saved/edited template needs: without this, a bad or unwanted custom
   // template would be permanently stuck, surviving even a re-paste of the loader, with no in-UI
-  // way back to the built-in one.
+  // way back to the built-in one. Round 6: rescoped to the ACTIVE entry only — a sibling template
+  // is left untouched, and Delete (above) is the way out of a bad ADDED template instead.
+  // dbPersist()'s own pristine rule (a lone "Default" entry holding the built-in text has nothing
+  // worth remembering) is what keeps this "forgetting", not merely overwriting, in the original
+  // single-template case, with no special-casing needed here.
   RW._dbResetTemplateToDefault = function(){
-    RW._dbDefaultTemplate = RW._dbBuiltinDefaultTemplate;
-    dbStorageRemove(RW._dbTemplateStorageKey);
+    const entry = dbActiveTemplate();
+    entry.text = RW._dbBuiltinDefaultTemplate;
+    RW._dbDefaultTemplate = entry.text;
+    dbPersist();
     const templateEl = document.getElementById('rw-db-template');
     if (templateEl) templateEl.value = RW._dbDefaultTemplate;
     RW._dbRebuildFields();
   };
+
+  // Reverse-parses `descText` against EVERY saved template and returns the best match — or null
+  // when nothing anchored matched anything at all (RW._dbParseDescription's own matchedLines
+  // stays 0 for every entry), in which case the caller keeps the active template and the existing
+  // "does not match" status speaks for itself. Ranking, in order: an EXACT byte-for-byte re-render
+  // (proof this description really came from this template, not just a heuristic — the same
+  // honest test RW._dbShowPrefill already applies) outranks everything; then matchedLines
+  // (absolute count of well-anchored template lines actually matched); then confidence,
+  // recovered-field count, and fewer weak fields; ties go to the CURRENTLY ACTIVE template, then
+  // to collection order — so detection never switches the annotator's template on a coin flip.
+  RW._dbDetectTemplate = function(descText){
+    const desc = String(descText == null ? '' : descText);
+    if (!desc.trim()) return null;
+
+    let best = null;
+    for (const entry of RW._dbTemplates){
+      let result;
+      try { result = RW._dbParseDescription(entry.text, desc); }
+      catch (e){ continue; }
+      if (!result.matchedLines) continue;
+
+      const span = result.span ? result.span.text : RW._dbSpan(result.values.top || '', result.values.bot || '', '').value;
+      const values = Object.assign({}, result.values, { span: span });
+      let rendered;
+      try { rendered = RW._dbRender(entry.text, values); }
+      catch (e){ rendered = null; }
+
+      const cand = { name: entry.name, result: result, exact: rendered === desc };
+      if (!best || dbBetterDetection(cand, best, entry.name === RW._dbActiveTemplateName)) best = cand;
+    }
+    return best;
+  };
+
+  // True when candidate `a` should replace `b` as the current best detection. `aIsActive` breaks
+  // an otherwise-total tie in `a`'s favor when `a` is the currently active template; leaving a
+  // real tie unresolved here keeps `b` (i.e. collection order, earlier wins) — see
+  // RW._dbDetectTemplate above for the full ranking this implements.
+  function dbBetterDetection(a, b, aIsActive){
+    if (a.exact !== b.exact) return a.exact;
+    if (a.result.matchedLines !== b.result.matchedLines) return a.result.matchedLines > b.result.matchedLines;
+    if (a.result.confidence !== b.result.confidence) return a.result.confidence > b.result.confidence;
+    if (a.result.recovered.length !== b.result.recovered.length) return a.result.recovered.length > b.result.recovered.length;
+    if (a.result.weak.length !== b.result.weak.length) return a.result.weak.length < b.result.weak.length;
+    return aIsActive;
+  }
 
   // Splices {name} into the template at its current caret (or over its selection), seeded with
   // the typed value once the field appears. Refuses a malformed name, a derived name ('span'/'a'),
@@ -1016,6 +1321,17 @@
       RW._dbSpanOverrideValue = prefill.span.text || '';
     }
     RW._dbRebuildFields(false, prefill ? prefill.values : null); // `false` still load-bearing (9k)
+
+    // Auto-engage the whole-description override: an Edit modal whose description matched NO
+    // saved template at all is precisely the case where the builder is currently at its worst —
+    // fields blank, the preview showing the template rendered with empty values, Fill one
+    // confirmation away from replacing a real description with that — so the real text is kept
+    // verbatim instead, ready to hand-edit. Decided AFTER every clear above, never before (round 4
+    // learned this ordering the hard way with RW._dbSpanOverridden — test 17j).
+    const info = RW._dbLastPrefill;
+    const shouldAutoOverride = !prefill && !!info && !info.applied && !!info.baseline && !!info.baseline.trim();
+    RW._dbSetOutputOverridden(shouldAutoOverride, shouldAutoOverride ? info.baseline : undefined);
+
     RW._dbShowPrefill();
   }
 
@@ -1046,7 +1362,7 @@
     try { result = RW._dbParseDescription(tpl, baseline); }
     catch (e){ return null; } // a pathological description can never break the panel
     const applied = result.recovered.length > 0 && result.confidence >= RW._dbPrefillMinConfidence;
-    RW._dbLastPrefill = { applied: applied, result: result, baseline: baseline };
+    RW._dbLastPrefill = { applied: applied, result: result, baseline: baseline, templateName: RW._dbActiveTemplateName };
     if (!applied) return null;
     return {
       values: result.values,
@@ -1105,24 +1421,55 @@
     // entirely out of the way (down to a single thin strip) without removing it.
     const body = mkEl('div', { id: 'rw-db-body' });
 
+    // Template picker — FIRST in body, before the template box itself. Visible in Simple mode too
+    // (see RW._dbApplyTemplateSelectVisibility) once there's more than one saved template.
+    const tplSelWrap = mkEl('div', { id: 'rw-db-tplsel-wrap' }, 'margin-bottom:4px;display:flex;align-items:center;gap:4px;');
+    tplSelWrap.appendChild(mkEl('span', { innerText: 'template' }, 'font-size:10px;opacity:0.75;min-width:50px;'));
+    const tplSelect = mkEl('select', { id: 'rw-db-template-select' }, 'flex:1;font-size:11px;');
+    tplSelect.addEventListener('change', () => {
+      RW._dbSetActiveTemplate(tplSelect.value);
+      // Picking the right source template for a label that's already open re-parses its
+      // description under it in one action, rather than leaving the annotator to also hit Re-read.
+      if (RW._dbLastPrefill) RW._dbRereadPrefill(modal);
+    });
+    tplSelWrap.appendChild(tplSelect);
+    body.appendChild(tplSelWrap);
+
     const templateWrap = mkEl('div', { id: 'rw-db-template-wrap' }, 'margin-bottom:4px;');
     templateWrap.appendChild(mkEl('div', { innerText: 'Template (edit freely — {name} becomes a field; saved automatically):' },
       'font-size:10px;opacity:0.7;'));
     const templateEl = mkEl('textarea', { id: 'rw-db-template', rows: 6, value: RW._dbDefaultTemplate },
       'width:98%;font-size:11px;font-family:monospace;');
-    // Every edit becomes the new effective default (RW._dbDefaultTemplate) AND is saved to
-    // localStorage — the one place a template edit flows through, so this is also what makes an
-    // edited template survive a same-session modal reopen, not just an actual page reload (see
-    // the persistence comment above RW._dbDefaultTemplate's own declaration).
+    // Every edit becomes the new effective default (RW._dbDefaultTemplate) AND lands in the
+    // ACTIVE entry, saved as part of the whole collection — the one place a template edit flows
+    // through, so this is also what makes an edited template survive a same-session modal
+    // reopen, not just an actual page reload (see the persistence comments above).
     templateEl.addEventListener('input', () => {
       RW._dbDefaultTemplate = templateEl.value;
-      dbStorageSet(RW._dbTemplateStorageKey, templateEl.value);
+      dbActiveTemplate().text = templateEl.value; // the mirror, kept in both directions
+      dbPersist();
       RW._dbRebuildFields();
     });
     templateWrap.appendChild(templateEl);
-    templateWrap.appendChild(mkBtn('rw-db-template-reset', 'Reset to default',
-      'Restore the built-in template and forget anything saved', () => RW._dbResetTemplateToDefault()));
     body.appendChild(templateWrap);
+
+    // Template management — Advanced only: name a template to Save as new or Rename the current
+    // one, Delete it, or reset just the current one back to the built-in text.
+    const tplMgrWrap = mkEl('div', { id: 'rw-db-tplmgr-wrap' },
+      'margin-bottom:4px;display:flex;gap:4px;align-items:center;flex-wrap:wrap;');
+    tplMgrWrap.appendChild(mkEl('input', { type: 'text', id: 'rw-db-tpl-name', placeholder: 'template name' }, 'width:110px;font-size:11px;'));
+    tplMgrWrap.appendChild(mkBtn('rw-db-tpl-saveas', 'Save as new',
+      'Save the template text above as a brand-new named template',
+      () => RW._dbSaveTemplateAs(document.getElementById('rw-db-tpl-name').value)));
+    tplMgrWrap.appendChild(mkBtn('rw-db-tpl-rename', 'Rename',
+      'Rename the current template (its text is unchanged)',
+      () => RW._dbRenameTemplate(document.getElementById('rw-db-tpl-name').value)));
+    tplMgrWrap.appendChild(mkBtn('rw-db-tpl-delete', 'Delete', 'Delete the current template', () => RW._dbDeleteTemplate()));
+    tplMgrWrap.appendChild(mkBtn('rw-db-template-reset', 'Reset to default',
+      'Restore the built-in template text for the current entry and forget anything saved for it',
+      () => RW._dbResetTemplateToDefault()));
+    tplMgrWrap.appendChild(mkEl('span', { id: 'rw-db-tpl-status' }, 'font-size:10px;opacity:0.8;'));
+    body.appendChild(tplMgrWrap);
 
     const addVarWrap = mkEl('div', { id: 'rw-db-addvar-wrap' },
       'margin-bottom:4px;display:flex;gap:4px;align-items:center;flex-wrap:wrap;');
@@ -1148,8 +1495,28 @@
     body.appendChild(mkEl('div', { id: 'rw-db-fields' }));
     body.appendChild(buildSpanRowSkeleton());
 
+    // Output area: a read-only preview by default, swapped for an editable override textarea by
+    // the Override button (RW._dbApplyOutputOverrideUI) — the whole-description escape hatch for
+    // text a template genuinely can't express.
+    const outputHeader = mkEl('div', { id: 'rw-db-output-header' }, 'display:flex;align-items:center;gap:4px;font-size:10px;');
+    outputHeader.appendChild(mkEl('span', { id: 'rw-db-output-status' }, 'flex:1;opacity:0.75;'));
+    outputHeader.appendChild(mkBtn('rw-db-output-override-btn', 'Override',
+      'Hand-edit the whole proposed description instead of generating it from the fields',
+      () => RW._dbSetOutputOverridden(true)));
+    outputHeader.appendChild(mkBtn('rw-db-output-revert-btn', '✕', 'Revert to the generated description',
+      () => RW._dbSetOutputOverridden(false)));
+    body.appendChild(outputHeader);
+
     body.appendChild(mkEl('pre', { id: 'rw-db-preview' },
       'white-space:pre-wrap;font-size:11px;background:#fff;border:1px solid #ccc;padding:4px;margin:4px 0;max-height:100px;overflow-y:auto;'));
+
+    const outputOverrideEl = mkEl('textarea', { id: 'rw-db-output-override', rows: 4 },
+      'width:98%;font-size:11px;font-family:monospace;display:none;margin:4px 0;');
+    outputOverrideEl.addEventListener('input', () => {
+      RW._dbOutputOverrideValue = outputOverrideEl.value;
+      RW._dbRunPreview(); // keeps the (hidden) <pre> truthful — never fights the textarea's caret
+    });
+    body.appendChild(outputOverrideEl);
 
     body.appendChild(mkBtn('rw-db-fill', 'Fill Description', "Write the rendered text into the Description field below", () => RW._dbRunFill(modal)));
 
@@ -1158,6 +1525,8 @@
 
     RW._dbApplyAdvancedVisibility();
     RW._dbApplyPanelExpanded();
+    RW._dbApplyOutputOverrideUI();
+    RW._dbRenderTemplateSelect();
     RW._dbRebuildFields();
   };
 
@@ -1165,7 +1534,7 @@
   // `rememberedCount` is how many of the still-missing names RW._dbRememberValues filled in from
   // the previous label instead — the hybrid case where some fields carry a DIFFERENT label's text,
   // which must never be silently invisible.
-  RW._dbPrefillStatusText = function(result, applied, rememberedCount){
+  RW._dbPrefillStatusText = function(result, applied, rememberedCount, templateName){
     if (!applied) return 'this description does not match the template — fields left blank';
     const total = result.recovered.length + result.missing.length;
     let text = (result.missing.length === 0 ? 'read all ' + total : 'read ' + result.recovered.length + ' of ' + total)
@@ -1173,6 +1542,7 @@
     if (result.missing.length) text += ' — blank: ' + result.missing.join(', ');
     if (result.weak.length) text += ' — double-check: ' + result.weak.join(', ');
     if (rememberedCount) text += ' (' + rememberedCount + ' from the previous label)';
+    if (templateName) text += ' (template: ' + templateName + ')';
     return text;
   };
 
@@ -1191,11 +1561,18 @@
 
     const rememberedCount = (RW._dbRememberValues && RW._dbLastValues)
       ? info.result.missing.filter((n) => RW._dbLastValues[n] != null).length : 0;
-    let text = RW._dbPrefillStatusText(info.result, info.applied, rememberedCount);
+    // The template-name clause is noise with only one saved template — only worth naming once
+    // there's more than one, since that's the only case where auto-detect could have switched it.
+    const templateName = RW._dbTemplates.length > 1 ? info.templateName : null;
+    let text = RW._dbPrefillStatusText(info.result, info.applied, rememberedCount, templateName);
     if (info.applied){
       const exact = RW._dbComputeOutput() === info.baseline;
       if (exact) RW._dbPrefillBaseline = info.baseline;
       text += exact ? ' — the preview matches it exactly' : ' — Fill will reword this description';
+    } else if (RW._dbOutputOverridden){
+      // The auto-engage note (see applyPrefill) — decided and applied BEFORE this function runs,
+      // so RW._dbOutputOverridden already reflects it here.
+      text += ' — override on, keeping it as-is';
     }
     status.innerText = text;
     wrap.style.display = 'flex';
@@ -1273,6 +1650,15 @@
       if (isModalEligible(modal) && !skipReset){
         let prefill = null;
         if (modalIsEdit(modal)){
+          // Round 6: auto-detect which SAVED TEMPLATE this description was written under, and
+          // switch the active selection to it before ever reading the prefill — so a label from a
+          // different drawing source parses against ITS template, not whatever was active before
+          // this modal opened. skipRebuild=true since RW._dbResetFields, just below, runs its own
+          // authoritative rebuild immediately after — doing it twice would be wasted work, not a
+          // correctness issue.
+          const descInp = modal.querySelector('#label-description');
+          const hit = RW._dbDetectTemplate(descInp ? descInp.value : '');
+          if (hit && hit.name !== RW._dbActiveTemplateName) RW._dbSetActiveTemplate(hit.name, true);
           // Always parsed against the DEFAULT template, not #rw-db-template's current value —
           // RW._dbResetFields is about to stomp the template box back to default too (same as
           // before this round), and the generated field rows will match it. RW._dbRereadPrefill

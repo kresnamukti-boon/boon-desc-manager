@@ -46,8 +46,9 @@ bash build_loader.sh
 
 Paste again after each page navigation — nothing here persists across a reload, including
 whatever you'd typed into the builder's own fields (the app's own **Save**, on the description
-field it writes into, is unaffected by this, same as always) — **except your Advanced template**,
-which is saved automatically and comes back on its own; see "Advanced mode" below.
+field it writes into, is unaffected by this, same as always) — **except your saved templates**,
+which come back on their own, both the templates themselves and which one you last had selected;
+see "Advanced mode" below.
 
 ## Using the builder
 
@@ -57,6 +58,10 @@ which is saved automatically and comes back on its own; see "Advanced mode" belo
   instead prefills the fields from its current description — see "Editing an existing label"
   below. Nothing is remembered from a label you filled a moment ago unless you turn that on
   yourself (see "Remembering values" below).
+- A **template** picker appears once you have more than one saved template (see "Advanced mode" —
+  different drawing sources often use different house formats). Picking one re-generates the
+  fields from it; if a label is already open, it also re-reads that label's description against
+  the newly-picked template in one action.
 - The **▼** caret at the left of the panel's own header collapses it down to just that one thin
   strip — click the **▶** it becomes to expand again. The whole panel also caps its own height and
   scrolls internally, so however many fields a template needs, it can never grow tall enough to
@@ -82,8 +87,11 @@ which is saved automatically and comes back on its own; see "Advanced mode" belo
 ### Editing an existing label
 
 Click an existing pin and choose to edit it, and the builder reads the description that's already
-there and fills the fields from it — you're correcting a label, not retyping it from scratch. A
-small status line above the fields says what happened:
+there and fills the fields from it — you're correcting a label, not retyping it from scratch. If
+you have more than one saved template, it also checks the description against every one of them
+first and switches the picker to whichever it actually matches, so a label from a different
+drawing source parses against its own template rather than whatever was active before you opened
+it. A small status line above the fields says what happened:
 
 - **`read all 8 fields from the existing description — the preview matches it exactly`** — the
   common case: change what you need, the rest is already right.
@@ -91,11 +99,16 @@ small status line above the fields says what happened:
   confidently recovered is left blank rather than guessed, same as it would be on a fresh label.
 - **`... — double-check: desc, keyword`** — recovered, but from a less certain spot in the
   description (e.g. a value that also appears elsewhere modified to lowercase) — worth a glance.
-- **`this description does not match the template — fields left blank`** — a hand-written
-  description, or one from a very different template; nothing here is guessed, you start fresh.
+- **`this description does not match the template — fields left blank`** — none of your saved
+  templates matched, most often a hand-written description. Rather than leave you with a preview
+  of empty-field boilerplate about to overwrite real text, the builder switches to **Override**
+  automatically (see below) with that original description ready to hand-edit — the status line
+  says so (`... — override on, keeping it as-is`).
 - **`... — Fill will reword this description`** instead of "the preview matches it exactly" means
   there's something in the existing text this add-on's fields can't represent (a hand-added
   sentence, most often) — clicking Fill would drop it, so double-check the preview before you do.
+- **`(template: SourceB)`** appended to any of the above (once you have more than one saved
+  template) names which one it actually matched against.
 
 Two buttons sit next to that status line: **Clear** blanks every field back out (without touching
 the Description field itself) if the prefill guessed badly and you'd rather start over, and
@@ -104,6 +117,18 @@ changed the template, since the fresh-open prefill always reads against the defa
 
 An **Override**d span (see below) is recovered too, if the description's height/depth line doesn't
 match what recomputing from the recovered top/bot would give.
+
+### Overriding the whole description
+
+Sometimes no template fits — a one-off note, a hand-written description from before you started
+using this add-on, anything the fields genuinely can't express. Click **Override** next to the
+preview and it becomes a plain text box, seeded with whatever the preview showed a moment ago,
+that you can edit directly; **Fill Description** then writes exactly what's in that box, ignoring
+the fields entirely. Click **✕** to go back to the generated preview at any time — your field
+values are untouched either way. This is exactly what happens automatically the moment a
+non-matching description is detected (see above): rather than let Fill silently replace real text
+with an empty-field rendering, the override engages on your behalf, seeded with that original
+description, ready to hand-edit.
 
 ### Advanced mode
 
@@ -124,11 +149,18 @@ Click **Advanced** in the panel's own header to reveal:
   with an inline message rather than silently doing nothing.
 - Switching back to **Simple** just hides these two — nothing you added is lost, and reopening
   Advanced later shows it again for the rest of the session.
-- **Your edited template is saved automatically** and carries over to your *next* session too —
-  re-paste the loader after a page reload and it's still there, no retyping. (Everything else in
-  this add-on — Simple/Advanced, Remember Values, the collapsed/expanded panel — stays session-only,
-  same as always.) Click **Reset to default** next to the template box to throw away your saved
-  template and go back to the built-in one.
+- **Multiple named templates** — one drawing source's house format is often genuinely different
+  from another's, so you're not limited to editing the one template in place. Type a name next to
+  the template box and click **Save as new** to save the current text as a brand-new named
+  template (the picker switches to it); **Rename** renames whichever one is currently selected
+  without touching its text; **Delete** removes it (refused if it's the only one left — there must
+  always be something selected). Every one of these actions, and any edit you type directly into
+  the template box, is saved automatically and carries over to your *next* session too — re-paste
+  the loader after a page reload and every saved template, and which one you last had selected,
+  is still there, no retyping. (Everything else in this add-on — Simple/Advanced, Remember Values,
+  the collapsed/expanded panel — stays session-only, same as always.) Click **Reset to default**
+  to throw away whatever's saved for the *current* template and restore its built-in text — it
+  never touches any other saved template.
 
 ### Remembering values
 

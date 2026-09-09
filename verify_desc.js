@@ -55,6 +55,16 @@ function makeStubWindow(){
       get firstChild(){ return this._children.length ? this._children[0] : null; },
       get parentElement(){ return this._parent || null; },
       get parentNode(){ return this._parent || null; },
+      // Minimal <select>/<option> support (round 6's template picker) — a real <select> derives
+      // `options`/`selectedIndex` from its child <option>s, so approximate that rather than
+      // leaving them undefined, even though this repo's own module only ever writes/reads
+      // `.value` and listens for `change` (a deliberately narrow contract — see CLAUDE.md).
+      get options(){ return this._children.filter((c) => c.tagName === 'OPTION'); },
+      get selectedIndex(){
+        const opts = this.options;
+        for (let i = 0; i < opts.length; i++) if (opts[i].value === this.value) return i;
+        return -1;
+      },
       setPointerCapture(){}, releasePointerCapture(){},
       setAttribute(name, val){ attrs[name] = String(val); if (name === 'list') this.list = val; },
       getAttribute(name){ return Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null; },
@@ -1154,7 +1164,8 @@ async function main(){
     ok(!!win.document.getElementById('rw-db-field-onlyfield'), '19a-3: the generated field row matches the seeded template');
   }
   {
-    // 19b: editing the textarea writes the new value into storage under the console-overridable key.
+    // 19b: editing the textarea saves the whole COLLECTION under the round-6 key (round 5's single
+    // legacy key is never written to any more — see section 20 for the collection-specific cases).
     let win = seedWin(makeStubWindow().win);
     win.MutationObserver = makeMutationObserverStub();
     makeFakeLabelModal(win, { title: 'Create New Label' });
@@ -1163,7 +1174,9 @@ async function main(){
     const templateEl = win.document.getElementById('rw-db-template');
     templateEl.value = '{custom} field';
     templateEl._fire('input', {});
-    ok(win.localStorage.getItem(RW._dbTemplateStorageKey) === '{custom} field', '19b: an edit is saved to localStorage under RW._dbTemplateStorageKey');
+    const saved = JSON.parse(win.localStorage.getItem(RW._dbTemplatesStorageKey));
+    ok(Array.isArray(saved) && saved.length === 1 && saved[0].name === 'Default' && saved[0].text === '{custom} field',
+      '19b: an edit is saved to localStorage as the active entry in the collection');
     ok(RW._dbDefaultTemplate === '{custom} field', '19b-2: the edit also becomes the new in-memory effective default immediately');
   }
   {
@@ -1220,7 +1233,9 @@ async function main(){
     ok(!!win.document.getElementById('rw-db-field-persisted'), '19e-2: the field rows still match the edited (not reverted) template');
   }
   {
-    // 19f: Reset to default clears storage and restores the exact built-in template.
+    // 19f: Reset to default clears storage (dbPersist's pristine rule — a lone "Default" entry
+    // holding the built-in text has nothing worth remembering) and restores the exact built-in
+    // template.
     let win = seedWin(makeStubWindow().win);
     win.MutationObserver = makeMutationObserverStub();
     makeFakeLabelModal(win, { title: 'Create New Label' });
@@ -1229,12 +1244,13 @@ async function main(){
     const templateEl = win.document.getElementById('rw-db-template');
     templateEl.value = '{custom}';
     templateEl._fire('input', {});
-    ok(win.localStorage.getItem(RW._dbTemplateStorageKey) === '{custom}', 'precondition: the custom edit was saved');
+    ok(win.localStorage.getItem(RW._dbTemplatesStorageKey) !== null, 'precondition: the custom edit was saved');
 
     win.document.getElementById('rw-db-template-reset')._fire('click', {});
     ok(RW._dbDefaultTemplate === RW._dbBuiltinDefaultTemplate, '19f: Reset to default restores RW._dbDefaultTemplate to the exact built-in template');
     ok(win.document.getElementById('rw-db-template').value === RW._dbBuiltinDefaultTemplate, '19f-2: the textarea reflects the reset immediately');
-    ok(win.localStorage.getItem(RW._dbTemplateStorageKey) === null, '19f-3: the stored value is forgotten, not merely overwritten with the built-in text');
+    ok(win.localStorage.getItem(RW._dbTemplatesStorageKey) === null && win.localStorage.getItem(RW._dbActiveTemplateStorageKey) === null,
+      '19f-3: the stored value is forgotten, not merely overwritten with the built-in text');
   }
   {
     // 19g: a blank/whitespace-only stored value is treated as nothing saved, not an intentional
@@ -1246,6 +1262,453 @@ async function main(){
     makeFakeLabelModal(win, { title: 'Create New Label' });
     const RW = loadModule(win);
     ok(RW._dbDefaultTemplate === RW._dbBuiltinDefaultTemplate, '19g: a whitespace-only stored value falls back to the built-in default');
+  }
+
+  /* ===== 20. Round 6 — a named collection of templates: resolution, selection persistence,
+     per-entry editing, management (save-as/rename/delete/reset), auto-detect on Edit, and the
+     picker's own visibility gating ===== */
+
+  // 20a: a corrupt/non-array JSON blob under the new key falls back to the built-in collection,
+  // without throwing.
+  {
+    const s = makeStubWindow();
+    let win = seedWin(s.win);
+    win.localStorage.setItem('rwDescTemplates', 'not valid json{');
+    win.MutationObserver = makeMutationObserverStub();
+    let threw = false, RW;
+    try { makeFakeLabelModal(win, { title: 'Create New Label' }); RW = loadModule(win); }
+    catch (e) { threw = true; }
+    ok(!threw, '20a: corrupt JSON under the collection key does not crash install');
+    ok(RW._dbTemplates.length === 1 && RW._dbTemplates[0].name === 'Default'
+      && RW._dbTemplates[0].text === RW._dbBuiltinDefaultTemplate,
+      '20a-2: falls back to a single built-in Default entry');
+  }
+  // 20b: a well-formed-but-wrong-shaped JSON blob (not an array of {name,text}) also falls back.
+  {
+    let win = seedWin(makeStubWindow().win);
+    win.localStorage.setItem('rwDescTemplates', JSON.stringify({ oops: true }));
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    ok(RW._dbTemplates.length === 1 && RW._dbTemplates[0].name === 'Default',
+      '20b: a non-array JSON value falls back to the built-in collection');
+  }
+  // 20c: a seeded valid collection wins over the built-in, and the seeded active name is honored.
+  {
+    let win = seedWin(makeStubWindow().win);
+    win.localStorage.setItem('rwDescTemplates', JSON.stringify([
+      { name: 'Default', text: '{onlydefault}' },
+      { name: 'SourceB', text: '{onlyb}' },
+    ]));
+    win.localStorage.setItem('rwDescActiveTemplate', 'SourceB');
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    ok(RW._dbTemplates.length === 2, '20c: a seeded valid collection wins over the built-in');
+    ok(RW._dbActiveTemplateName === 'SourceB', '20c-2: the seeded active selection is honored');
+    ok(RW._dbDefaultTemplate === '{onlyb}', '20c-3: the effective default mirrors the ACTIVE entry, not entry 0');
+  }
+  // 20d: an active name that no longer names any surviving entry falls back to entry 0.
+  {
+    let win = seedWin(makeStubWindow().win);
+    win.localStorage.setItem('rwDescTemplates', JSON.stringify([{ name: 'Default', text: '{x}' }]));
+    win.localStorage.setItem('rwDescActiveTemplate', 'Ghost');
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    ok(RW._dbActiveTemplateName === 'Default', '20d: an unknown stored active name falls back to entry 0');
+  }
+  // 20e: a pre-set RW._dbTemplates console override wins over whatever storage holds.
+  {
+    let win = seedWin(makeStubWindow().win);
+    win.localStorage.setItem('rwDescTemplates', JSON.stringify([{ name: 'FromStorage', text: '{s}' }]));
+    win.__RW = { _dbTemplates: [{ name: 'FromConsole', text: '{c}' }] };
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    ok(RW._dbTemplates.length === 1 && RW._dbTemplates[0].name === 'FromConsole',
+      '20e: a pre-set RW._dbTemplates console override wins over a seeded collection');
+  }
+  // 20f: a pre-set RW._dbDefaultTemplate still wins as the active text (round 5's contract,
+  // applied to whichever entry ends up active — here entry 0, since RW._dbTemplates itself
+  // wasn't overridden).
+  {
+    let win = seedWin(makeStubWindow().win);
+    win.__RW = { _dbDefaultTemplate: '{fromconsole}' };
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    ok(RW._dbDefaultTemplate === '{fromconsole}', '20f: a pre-set RW._dbDefaultTemplate still wins as the active text');
+    ok(RW._dbTemplates[0].text === '{fromconsole}', '20f-2: the override is written into the active entry itself');
+  }
+  // 20g: throwing storage -> the built-in collection, in-memory only, no crash.
+  {
+    const s = makeStubWindow();
+    let win = seedWin(s.win);
+    win.localStorage = s.makeStorage({ throwing: true });
+    win.MutationObserver = makeMutationObserverStub();
+    let threw = false, RW;
+    try { makeFakeLabelModal(win, { title: 'Create New Label' }); RW = loadModule(win); }
+    catch (e) { threw = true; }
+    ok(!threw, '20g: throwing storage does not crash install');
+    ok(RW && RW._dbTemplates.length === 1 && RW._dbTemplates[0].text === RW._dbBuiltinDefaultTemplate,
+      '20g-2: falls back to the built-in collection, in-memory only');
+  }
+  // 20h: legacy migration — only the OLD single-template key is seeded, no new-style collection
+  // yet: adopted as one "Default" entry, selected.
+  {
+    let win = seedWin(makeStubWindow().win);
+    win.localStorage.setItem('rwDescTemplate', '{legacyonly}');
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    ok(RW._dbTemplates.length === 1 && RW._dbTemplates[0].name === 'Default' && RW._dbTemplates[0].text === '{legacyonly}',
+      '20h: a legacy single template is migrated in as one Default entry');
+    ok(RW._dbActiveTemplateName === 'Default', '20h-2: the migrated entry is selected');
+  }
+  // 20i: an edit lands in the ACTIVE entry (not entry 0 if a different one is active), survives a
+  // same-session reopen, and leaves a SIBLING entry's text untouched.
+  {
+    let win = seedWin(makeStubWindow().win);
+    const MO = makeMutationObserverStub();
+    win.MutationObserver = MO;
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+
+    // Save the current (built-in) text as a new entry "B" — RW._dbSaveTemplateAs selects it.
+    win.document.getElementById('rw-db-tpl-name').value = 'B';
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
+    ok(RW._dbTemplates.length === 2 && RW._dbActiveTemplateName === 'B', '20i: Save as new appends and selects the new entry');
+
+    const templateEl = win.document.getElementById('rw-db-template');
+    templateEl.value = '{onlyb}';
+    templateEl._fire('input', {});
+    ok(RW._dbTemplates.find((t) => t.name === 'Default').text === RW._dbBuiltinDefaultTemplate,
+      "20i-2: editing while B is active leaves Default's own text untouched");
+
+    modal.hidden = true; MO._instances[0].trigger();
+    modal.hidden = false; MO._instances[0].trigger();
+    ok(win.document.getElementById('rw-db-template').value === '{onlyb}',
+      '20i-3: the per-entry edit survives a same-session modal reopen');
+
+    // Switching selection reflects the OTHER entry's own (unedited) text.
+    win.document.getElementById('rw-db-template-select').value = 'Default';
+    win.document.getElementById('rw-db-template-select')._fire('change', {});
+    ok(win.document.getElementById('rw-db-template').value === RW._dbBuiltinDefaultTemplate,
+      '20i-4: switching back to Default shows ITS own (unedited) text');
+  }
+  // 20j: templates AND the active selection both survive a "reload" (a fresh window sharing the
+  // same underlying localStorage data).
+  {
+    const win1 = seedWin(makeStubWindow().win);
+    win1.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win1, { title: 'Create New Label' });
+    const RW1 = loadModule(win1);
+    win1.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win1.document.getElementById('rw-db-tpl-name').value = 'B';
+    win1.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
+
+    const win2 = seedWin(makeStubWindow().win);
+    win2.localStorage = win1.localStorage; // same underlying storage = the same browser origin
+    win2.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win2, { title: 'Create New Label' });
+    const RW2 = loadModule(win2);
+    ok(RW2._dbTemplates.length === 2, '20j: both templates survive a reload');
+    ok(RW2._dbActiveTemplateName === 'B', '20j-2: the active SELECTION survives the reload too');
+  }
+  // 20k: Save as new / Rename / Delete refusals, reported inline in #rw-db-tpl-status.
+  {
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    const status = win.document.getElementById('rw-db-tpl-status');
+    const nameEl = win.document.getElementById('rw-db-tpl-name');
+
+    nameEl.value = '   ';
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
+    ok(RW._dbTemplates.length === 1 && status.innerText.length > 0, '20k: a blank name is refused, reported inline');
+
+    nameEl.value = 'B';
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
+    ok(RW._dbTemplates.length === 2 && RW._dbActiveTemplateName === 'B', 'precondition: B saved and selected');
+
+    nameEl.value = 'B'; // a second entry now genuinely exists to collide with
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
+    ok(RW._dbTemplates.length === 2, '20k-2: Save as new refuses a name already in use (case-insensitively)');
+
+    nameEl.value = 'default'; // B (active) renamed to a case-variant of the OTHER entry's name
+    win.document.getElementById('rw-db-tpl-rename')._fire('click', {});
+    ok(RW._dbActiveTemplateName === 'B', '20k-3: Rename refuses a case-insensitive duplicate of a DIFFERENT entry — nothing changed');
+
+    nameEl.value = 'Renamed';
+    win.document.getElementById('rw-db-tpl-rename')._fire('click', {});
+    ok(RW._dbActiveTemplateName === 'Renamed' && RW._dbTemplates.some((t) => t.name === 'Renamed'),
+      '20k-4: a valid Rename takes effect and keeps the selection on the renamed entry');
+
+    win.document.getElementById('rw-db-tpl-delete')._fire('click', {}); // drops "Renamed", back to just Default
+    ok(RW._dbTemplates.length === 1 && RW._dbActiveTemplateName === 'Default', 'precondition: back down to one entry');
+    win.document.getElementById('rw-db-tpl-delete')._fire('click', {});
+    ok(RW._dbTemplates.length === 1 && status.innerText.length > 0,
+      '20k-5: Delete refuses to remove the last remaining template, reported inline');
+  }
+  // 20l: Delete drops the active entry and selects entry 0 when more than one exists.
+  {
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win.document.getElementById('rw-db-tpl-name').value = 'B';
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
+    ok(RW._dbActiveTemplateName === 'B', 'precondition: B is active');
+    win.document.getElementById('rw-db-tpl-delete')._fire('click', {});
+    ok(RW._dbTemplates.length === 1 && RW._dbActiveTemplateName === 'Default',
+      '20l: Delete removes the active entry and falls back to entry 0');
+  }
+  // 20m: Reset to default touches only the ACTIVE entry — a sibling's custom text is untouched.
+  {
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win.document.getElementById('rw-db-tpl-name').value = 'B';
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
+    const templateEl = win.document.getElementById('rw-db-template');
+    templateEl.value = '{customb}';
+    templateEl._fire('input', {});
+
+    win.document.getElementById('rw-db-template-select').value = 'Default';
+    win.document.getElementById('rw-db-template-select')._fire('change', {});
+    templateEl.value = '{customdefault}';
+    templateEl._fire('input', {});
+
+    win.document.getElementById('rw-db-template-reset')._fire('click', {});
+    ok(RW._dbTemplates.find((t) => t.name === 'Default').text === RW._dbBuiltinDefaultTemplate,
+      '20m: Reset to default restores the ACTIVE entry (Default) to the built-in text');
+    ok(RW._dbTemplates.find((t) => t.name === 'B').text === '{customb}',
+      "20m-2: a sibling entry's custom text is left untouched by Reset");
+  }
+  // 20n/20o: auto-detect on Edit — switches to the template the description actually matches,
+  // recovers it exactly, and never fires on Create.
+  {
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win.document.getElementById('rw-db-tpl-name').value = 'SourceB';
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
+    const templateEl = win.document.getElementById('rw-db-template');
+    templateEl.value = 'material: {material}\nnotes: {notes}';
+    templateEl._fire('input', {});
+    // Back to Default (the built-in, unrelated template) before Edit ever opens.
+    win.document.getElementById('rw-db-template-select').value = 'Default';
+    win.document.getElementById('rw-db-template-select')._fire('change', {});
+    ok(RW._dbActiveTemplateName === 'Default', 'precondition: Default is active before Edit opens');
+
+    const descForB = 'material: Concrete\nnotes: see sheet A2';
+    const hit = RW._dbDetectTemplate(descForB);
+    ok(hit && hit.name === 'SourceB' && hit.exact === true,
+      '20n: RW._dbDetectTemplate finds the exact match among saved templates — got ' + JSON.stringify(hit && { name: hit.name, exact: hit.exact }));
+
+    ok(RW._dbDetectTemplate('A hand-written description already here.') === null,
+      '20n-2: an unrelated hand-written description matches nothing (matchedLines stays 0 for every entry)');
+
+    // 20n-3: a genuine tie — two structurally identical templates (differing only in variable
+    // name) score identically on every metric including exactness. The currently active one wins.
+    win.document.getElementById('rw-db-template-select').value = 'SourceB';
+    win.document.getElementById('rw-db-template-select')._fire('change', {});
+    templateEl.value = 'x: {foo}';
+    templateEl._fire('input', {});
+    win.document.getElementById('rw-db-tpl-name').value = 'Alt';
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {}); // saves + selects "Alt"
+    templateEl.value = 'x: {bar}';
+    templateEl._fire('input', {});
+    ok(RW._dbActiveTemplateName === 'Alt', 'precondition: Alt (x: {bar}) is active');
+
+    const tieHit = RW._dbDetectTemplate('x: hello');
+    ok(tieHit && tieHit.name === 'Alt', "20n-3: a genuine tie (identical scores, both exact) is won by the ACTIVE template — got " + JSON.stringify(tieHit && tieHit.name));
+
+    win.document.getElementById('rw-db-template-select').value = 'SourceB';
+    win.document.getElementById('rw-db-template-select')._fire('change', {});
+    const tieHit2 = RW._dbDetectTemplate('x: hello');
+    ok(tieHit2 && tieHit2.name === 'SourceB', '20n-4: switching which one is active flips which side of the tie wins');
+  }
+  {
+    // 20o: the full DOM seam — an Edit modal holding a description rendered from the SECOND saved
+    // template switches the picker to it and prefills exactly.
+    let win = seedWin(makeStubWindow().win);
+    const MO = makeMutationObserverStub();
+    win.MutationObserver = MO;
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    win.document.getElementById('rw-db-tpl-name').value = 'SourceB';
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
+    const templateEl = win.document.getElementById('rw-db-template');
+    templateEl.value = 'material: {material}\nnotes: {notes}';
+    templateEl._fire('input', {});
+    win.document.getElementById('rw-db-template-select').value = 'Default';
+    win.document.getElementById('rw-db-template-select')._fire('change', {});
+
+    modal.hidden = true; MO._instances[0].trigger();
+    modal.querySelector('#label-modal-title').textContent = 'Edit Label';
+    modal.querySelector('#label-description').value = 'material: Concrete\nnotes: see sheet A2';
+    modal.hidden = false; MO._instances[0].trigger();
+
+    ok(win.document.getElementById('rw-db-template-select').value === 'SourceB',
+      '20o: opening Edit on a description matching SourceB switches the picker to it');
+    ok(win.document.getElementById('rw-db-field-material').value === 'Concrete',
+      '20o-2: fields prefill from the newly-detected template');
+    ok(win.document.getElementById('rw-db-prefill-status').innerText.indexOf('preview matches it exactly') !== -1,
+      '20o-3: the prefill is an exact byte-for-byte match');
+
+    // A Create modal never runs detection at all — the picker stays on whatever was active.
+    modal.hidden = true; MO._instances[0].trigger();
+    modal.querySelector('#label-modal-title').textContent = 'Create New Label';
+    modal.querySelector('#label-description').value = 'material: Concrete\nnotes: see sheet A2';
+    modal.hidden = false; MO._instances[0].trigger();
+    ok(win.document.getElementById('rw-db-template-select').value === 'SourceB',
+      '20o-4: a Create modal never runs auto-detect — the active template is unchanged');
+  }
+  // 20p: picker visibility — hidden in Simple with one template, shown in Advanced regardless,
+  // shown in Simple once a second template exists.
+  {
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    ok(win.document.getElementById('rw-db-tplsel-wrap').style.display === 'none',
+      '20p: the picker is hidden in Simple mode with only one template');
+
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {});
+    ok(win.document.getElementById('rw-db-tplsel-wrap').style.display === '',
+      '20p-2: the picker is always shown in Advanced mode');
+
+    win.document.getElementById('rw-db-tpl-name').value = 'B';
+    win.document.getElementById('rw-db-tpl-saveas')._fire('click', {});
+    win.document.getElementById('rw-db-adv-toggle')._fire('click', {}); // back to Simple
+    ok(win.document.getElementById('rw-db-tplsel-wrap').style.display === '',
+      '20p-3: once a second template exists, the picker shows in Simple mode too');
+  }
+
+  /* ===== 21. Round 6 — whole-description override ===== */
+  {
+    // 21a/21b: manual engage/revert, seeded from the current preview, with a standing status note.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-field-desc').value = 'Concrete';
+    win.document.getElementById('rw-db-field-desc')._fire('input', {});
+    const generated = win.document.getElementById('rw-db-preview').innerText;
+
+    win.document.getElementById('rw-db-output-override-btn')._fire('click', {});
+    ok(RW._dbOutputOverridden === true, '21a: Override engages');
+    ok(win.document.getElementById('rw-db-output-override').value === generated,
+      '21a-2: the override textarea is seeded with exactly what the preview showed');
+    ok(win.document.getElementById('rw-db-output-status').innerText.length > 0, '21a-3: a standing status note appears');
+    ok(win.document.getElementById('rw-db-preview').style.display === 'none', '21a-4: the read-only preview is hidden while overridden');
+
+    win.document.getElementById('rw-db-output-revert-btn')._fire('click', {});
+    ok(RW._dbOutputOverridden === false, '21b: ✕ reverts');
+    ok(win.document.getElementById('rw-db-output-status').innerText === '', '21b-2: the status note clears');
+    ok(win.document.getElementById('rw-db-preview').style.display !== 'none', '21b-3: the preview reappears');
+  }
+  {
+    // 21c: typing in the override textarea drives RW._dbComputeOutput and Fill, verbatim — the
+    // preview/Fill single-source invariant, holding for the override too.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-output-override-btn')._fire('click', {});
+    const ta = win.document.getElementById('rw-db-output-override');
+    ta.value = 'Hand-typed whole description.';
+    ta._fire('input', {});
+    ok(RW._dbComputeOutput() === 'Hand-typed whole description.', '21c: RW._dbComputeOutput returns the override text verbatim');
+
+    win.document.getElementById('rw-db-fill')._fire('click', {});
+    const descInp = modal.querySelector('#label-description');
+    ok(descInp.value === 'Hand-typed whole description.', '21c-2: Fill writes the override text into #label-description');
+  }
+  {
+    // 21d: field edits while overridden leave the output unchanged (the span-override analogue).
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-output-override-btn')._fire('click', {});
+    win.document.getElementById('rw-db-output-override').value = 'Frozen text.';
+    win.document.getElementById('rw-db-output-override')._fire('input', {});
+    win.document.getElementById('rw-db-field-desc').value = 'Concrete';
+    win.document.getElementById('rw-db-field-desc')._fire('input', {});
+    ok(RW._dbComputeOutput() === 'Frozen text.', '21d: a field edit while overridden does not change the output');
+  }
+  {
+    // 21e/21f: a hidden->visible reopen clears the override, and so do Clear and Re-read.
+    let win = seedWin(makeStubWindow().win);
+    const MO = makeMutationObserverStub();
+    win.MutationObserver = MO;
+    const modal = makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-output-override-btn')._fire('click', {});
+    ok(RW._dbOutputOverridden === true, 'precondition: override engaged');
+    modal.hidden = true; MO._instances[0].trigger();
+    modal.hidden = false; MO._instances[0].trigger();
+    ok(RW._dbOutputOverridden === false, '21e: a fresh modal open clears the override');
+  }
+  {
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Edit Label', description: 'Concrete - Wall\nschedule' });
+    const RW = loadModule(win);
+    win.document.getElementById('rw-db-output-override-btn')._fire('click', {});
+    win.document.getElementById('rw-db-prefill-reread')._fire('click', {});
+    ok(RW._dbOutputOverridden === false, '21f: Re-read drops the override');
+
+    win.document.getElementById('rw-db-output-override-btn')._fire('click', {});
+    win.document.getElementById('rw-db-prefill-clear')._fire('click', {});
+    ok(RW._dbOutputOverridden === false, '21f-2: Clear drops the override too');
+  }
+  {
+    // 21g: auto-engage — an Edit modal whose description matches no template engages the override
+    // holding that description byte-for-byte, so Fill reproduces it exactly.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    const modal = makeFakeLabelModal(win, { title: 'Edit Label', description: 'A hand-written description already here.' });
+    const RW = loadModule(win);
+    ok(RW._dbOutputOverridden === true, '21g: the override auto-engages on a non-matching Edit description');
+    ok(win.document.getElementById('rw-db-output-override').value === 'A hand-written description already here.',
+      '21g-2: seeded with the original description verbatim');
+    ok(win.document.getElementById('rw-db-prefill-status').innerText.indexOf('override on, keeping it as-is') !== -1,
+      '21g-3: the prefill status explains why');
+
+    win.document.getElementById('rw-db-fill')._fire('click', {}); // first click only arms (non-empty textarea)
+    win.document.getElementById('rw-db-fill')._fire('click', {}); // second click commits
+    const descInp = modal.querySelector('#label-description');
+    ok(descInp.value === 'A hand-written description already here.',
+      '21g-4: Fill reproduces the original description exactly, rather than an empty-field rendering');
+  }
+  {
+    // 21h: a Create modal with a blank textarea never auto-engages.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Create New Label' });
+    const RW = loadModule(win);
+    ok(RW._dbOutputOverridden === false, '21h: a fresh Create modal never auto-engages the override');
+  }
+  {
+    // 21i: an Edit modal that DID prefill successfully never auto-engages either.
+    let win = seedWin(makeStubWindow().win);
+    win.MutationObserver = makeMutationObserverStub();
+    makeFakeLabelModal(win, { title: 'Edit Label', description: 'Concrete - Wall\nschedule' });
+    const RW = loadModule(win);
+    ok(RW._dbOutputOverridden === false, '21i: a successfully-prefilled Edit modal does not auto-engage the override');
   }
 
   console.log((pass + fail) + ' tests, ' + pass + ' passed, ' + fail + ' failed');
